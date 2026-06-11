@@ -221,6 +221,7 @@ pub struct OssHdfsConf {
     pub endpoint_url: String,
     pub access_key: String,
     pub secret_key: String,
+    pub bucket: Option<String>,
     pub region_name: Option<String>,
     pub data_endpoint: Option<String>,
     pub second_level_domain_enable: bool,
@@ -233,6 +234,7 @@ impl OssHdfsConf {
     pub const USER_ENDPOINT: &'static str = "oss.endpoint";
     pub const USER_ACCESS_KEY_ID: &'static str = "oss.accessKeyId";
     pub const USER_ACCESS_KEY_SECRET: &'static str = "oss.accessKeySecret";
+    pub const USER_BUCKET: &'static str = "bucket";
     pub const USER_REGION: &'static str = "oss.region";
     pub const USER_DATA_ENDPOINT: &'static str = "oss.data.endpoint";
     pub const USER_SECOND_LEVEL_DOMAIN_ENABLE: &'static str = "oss.second.level.domain.enable";
@@ -259,6 +261,7 @@ impl OssHdfsConf {
         let endpoint_url = map.get_string(Self::USER_ENDPOINT)?;
         let access_key = map.get_string(Self::USER_ACCESS_KEY_ID)?;
         let secret_key = map.get_string(Self::USER_ACCESS_KEY_SECRET)?;
+        let bucket = map.get_string(Self::USER_BUCKET).ok();
         let region_name = map.get_string(Self::USER_REGION).ok();
         let data_endpoint = map.get_string(Self::USER_DATA_ENDPOINT).ok();
         let second_level_domain_enable = map
@@ -272,6 +275,7 @@ impl OssHdfsConf {
             endpoint_url,
             access_key,
             secret_key,
+            bucket,
             region_name,
             data_endpoint,
             second_level_domain_enable,

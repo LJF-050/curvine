@@ -62,6 +62,7 @@ pub struct OssHdfsFileSystem {
 struct OssHdfsFileSystemInner {
     fs_handle: JindoFileSystemHandle,
     conf: UfsConf,
+    bucket: String,
 }
 
 impl Drop for OssHdfsFileSystemInner {
@@ -100,16 +101,25 @@ impl OssHdfsFileSystem {
                 }
             })?;
 
-        let bucket = path
-            .authority()
-            .ok_or_else(|| FsError::invalid_path(path.full_path(), "URI missing bucket name"))?
-            .to_string();
-
         // Convert HashMap to UfsConf for storage
         let ufs_conf = UfsConf::with_map(conf.clone());
 
         let oss_hdfs_conf = OssHdfsConf::with_map(conf)
             .map_err(|e| FsError::from(e).ctx("Invalid OSS configuration"))?;
+        // A present-but-empty `bucket` property must not shadow the URI authority:
+        // otherwise we build invalid paths like `oss:///path`. Treat blank values
+        // as absent on both the configured property and the authority fallback.
+        let bucket = oss_hdfs_conf
+            .bucket
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                path.authority()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| FsError::invalid_path(path.full_path(), "URI missing bucket name"))?;
 
         // Create JindoSDK config
         let config_handle_ptr = unsafe { jindo_config_new() };
@@ -138,6 +148,9 @@ impl OssHdfsFileSystem {
 
             if let Some(region_name) = &oss_hdfs_conf.region_name {
                 set_config_string(config_handle.as_raw(), OssHdfsConf::REGION, region_name)?;
+            }
+            if let Some(data_endpoint) = &oss_hdfs_conf.data_endpoint {
+                set_config_string(config_handle.as_raw(), OssHdfsConf::DATA_ENDPOINT, data_endpoint)?;
             }
 
             // Set OSS-HDFS specific flags
@@ -194,6 +207,7 @@ impl OssHdfsFileSystem {
             inner: Arc::new(OssHdfsFileSystemInner {
                 fs_handle,
                 conf: ufs_conf,
+                bucket,
             }),
         })
     }
@@ -204,14 +218,16 @@ impl OssHdfsFileSystem {
         // both "/ufs-test/dir1" and "ufs-test/dir1" as "invalid path".
         //
         // The most reliable format is the full OSS URI, e.g. "oss://bucket/ufs-test/dir1".
-        // `Path::full_path()` preserves scheme + authority + normalized path.
+        // When the web/API input uses an OSS-HDFS endpoint as URI authority
+        // ("oss://bucket.region.oss-dls.aliyuncs.com/path"), the real bucket is carried in
+        // properties["bucket"]. Rewrite to the bucket URI expected by JindoSDK.
         //
         // (Note: `OssHdfsFileSystem` should only be used with `oss://...` paths, but we keep
         // a defensive fallback for non-URI paths.)
         let s = if path.scheme() == Some(SCHEME) {
-            path.full_path()
+            format!("oss://{}{}", self.inner.bucket, path.path())
         } else {
-            path.path()
+            path.path().to_string()
         };
 
         CString::new(s).map_err(cstring_err)
