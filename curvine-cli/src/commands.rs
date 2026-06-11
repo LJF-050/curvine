@@ -31,6 +31,10 @@ pub enum Commands {
     #[command(name = "load-status")]
     LoadStatus(LoadStatusCommand),
 
+    /// List recent load/export jobs
+    #[command(name = "load-list")]
+    LoadList(LoadListCommand),
+
     /// Cancel loading task
     #[command(name = "cancel-load")]
     CancelLoad(CancelLoadCommand),

@@ -86,6 +86,11 @@ impl RaftClient {
         self.rt.block_on(self.send_propose(data))
     }
 
+    pub async fn transfer_leader(&self, target_id: NodeId) -> RaftResult<TransferLeaderResponse> {
+        let req = TransferLeaderRequest { target_id };
+        self.leader_rpc(RaftCode::TransferLeader, req).await
+    }
+
     // Join the cluster.
     pub async fn join_cluster(&self, id: NodeId, addr: &InetAddr) -> RaftResult<()> {
         let change = ConfChange {

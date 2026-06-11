@@ -13,4 +13,5 @@
 // limitations under the License.
 
 mod job_master_client;
+pub use self::job_master_client::JobListOptions;
 pub use self::job_master_client::JobMasterClient;

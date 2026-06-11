@@ -401,6 +401,22 @@ impl FsClient {
         self.rpc_bytes(RpcCode::GetMasterInfo, header).await
     }
 
+    pub async fn set_worker_status(
+        &self,
+        worker: impl AsRef<str>,
+        status: impl AsRef<str>,
+    ) -> FsResult<(WorkerInfo, String)> {
+        let header = SetWorkerStatusRequest {
+            worker: worker.as_ref().to_string(),
+            status: status.as_ref().to_string(),
+        };
+        let rep: SetWorkerStatusResponse = self.rpc(RpcCode::SetWorkerStatus, header).await?;
+        Ok((
+            ProtoUtils::worker_info_from_pb(vec![rep.worker]).remove(0),
+            rep.status,
+        ))
+    }
+
     pub async fn mount(
         &self,
         ufs_path: &Path,

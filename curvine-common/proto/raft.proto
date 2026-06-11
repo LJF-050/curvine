@@ -91,6 +91,15 @@ message RaftRequest {
 message RaftResponse {
 }
 
+message TransferLeaderRequest {
+    required uint64 target_id = 1;
+}
+
+message TransferLeaderResponse {
+    required uint64 previous_leader_id = 1;
+    required uint64 target_id = 2;
+}
+
 // Download snapshot request.
 message SnapshotDownloadRequest {
     required string dir = 1;

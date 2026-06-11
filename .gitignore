@@ -1,4 +1,9 @@
 target/
+target-web/
+target-check/
+logs/
+nohup.out
+data/
 testing/
 .idea/
 .vscode

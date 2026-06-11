@@ -32,12 +32,7 @@ use std::sync::Arc;
 #[command(author, version = version::VERSION, about, long_about = None)]
 pub struct CurvineArgs {
     /// Configuration file path (optional)
-    #[arg(
-        short,
-        long,
-        help = "Configuration file path (optional)",
-        global = true
-    )]
+    #[arg(long, help = "Configuration file path (optional)", global = true)]
     pub conf: Option<String>,
 
     /// Master address list (e.g., 'm1:8995,m2:8995')
@@ -121,6 +116,7 @@ fn main() -> CommonResult<()> {
             Commands::Report(cmd) => cmd.execute(curvine_fs).await,
             Commands::Load(cmd) => cmd.execute(load_client).await,
             Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
+            Commands::LoadList(cmd) => cmd.execute(load_client).await,
             Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
             Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,

@@ -18,17 +18,21 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::executor::ScheduledExecutor;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
 use dashmap::DashMap;
-use log::info;
+use log::{info, warn};
 use orpc::common::TimeSpent;
 use orpc::runtime::{GroupExecutor, Runtime};
 use orpc::sync::StateCtl;
 use orpc::CommonResult;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 /// Worker block management role.
 /// 1. Register worker with master
 /// 2. Report block information to the master
 /// 3. Accept the master's instructions and delete the block data.
+const STARTUP_RETRY_INTERVAL_MS: u64 = 2_000;
+
 pub struct BlockActor {
     pub(crate) client: MasterClient,
     store: BlockStore,
@@ -81,26 +85,46 @@ impl BlockActor {
     pub fn start(self) {
         info!("start block actor");
 
-        self.register().unwrap();
+        self.retry_until_ready("worker register", || self.register());
         info!("worker register success");
 
         let spend = TimeSpent::new();
-        let total_len = self.full_block_report().unwrap();
+        let total_len = self.retry_until_ready("worker block report", || self.full_block_report());
         info!(
             "worker block report success, total blocks {}, used {} ms",
             total_len,
             spend.used_ms()
         );
 
-        Self::start_heartbeat(
-            self.executor.clone(),
-            self.worker_ctl.clone(),
-            self.client.clone(),
-            self.store.clone(),
-            self.report_blocks.clone(),
-            self.heartbeat_interval_ms,
-        )
-        .unwrap();
+        self.retry_until_ready("worker heartbeat scheduler", || {
+            Self::start_heartbeat(
+                self.executor.clone(),
+                self.worker_ctl.clone(),
+                self.client.clone(),
+                self.store.clone(),
+                self.report_blocks.clone(),
+                self.heartbeat_interval_ms,
+            )
+        });
+    }
+
+    fn retry_until_ready<T>(
+        &self,
+        action_name: &str,
+        mut action: impl FnMut() -> CommonResult<T>,
+    ) -> T {
+        loop {
+            match action() {
+                Ok(value) => return value,
+                Err(err) => {
+                    warn!(
+                        "{} failed, retrying in {} ms: {}",
+                        action_name, STARTUP_RETRY_INTERVAL_MS, err
+                    );
+                    thread::sleep(Duration::from_millis(STARTUP_RETRY_INTERVAL_MS));
+                }
+            }
+        }
     }
 
     // Worker registration.

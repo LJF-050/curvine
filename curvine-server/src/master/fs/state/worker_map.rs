@@ -67,9 +67,16 @@ impl WorkerMap {
             info.add_storage(item);
         }
 
-        // The worker dcm state does not change
+        // Manual management state should survive heartbeat refreshes.
         info.status = match self.workers.get(&worker_id) {
-            Some(v) if v.status == WorkerStatus::Decommission => v.status,
+            Some(v)
+                if matches!(
+                    v.status,
+                    WorkerStatus::Blacklist | WorkerStatus::Decommission
+                ) =>
+            {
+                v.status
+            }
             _ => WorkerStatus::Live,
         };
 

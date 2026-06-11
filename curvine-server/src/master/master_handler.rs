@@ -25,6 +25,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
     CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags, RenameFlags,
+    WorkerInfo, WorkerStatus,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
@@ -425,6 +426,44 @@ impl MasterHandler {
         ctx.response_buf(rep_header, &mut self.buf)
     }
 
+    fn worker_matches(worker: &WorkerInfo, selector: &str) -> bool {
+        let selector = selector.trim();
+        if selector.contains(':') {
+            return worker.address.connect_addr() == selector;
+        }
+        worker.worker_id().to_string() == selector
+            || worker.address.worker_id.to_string() == selector
+            || worker.address.hostname == selector
+            || worker.address.ip_addr == selector
+    }
+
+    pub fn set_worker_status(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: SetWorkerStatusRequest = ctx.parse_header()?;
+        let target_status = match req.status.trim().to_lowercase().as_str() {
+            "live" | "allow" | "recommission" | "remove_blacklist" | "remove_decommission" => {
+                WorkerStatus::Live
+            }
+            "blacklist" | "block" => WorkerStatus::Blacklist,
+            "decommission" | "retire" => WorkerStatus::Decommission,
+            status => return err_box!("unsupported worker status: {}", status),
+        };
+
+        let mut wm = self.fs.worker_manager.write();
+        for (_, worker) in wm.worker_map.workers.iter_mut() {
+            if Self::worker_matches(worker, &req.worker) {
+                worker.status = target_status;
+                let status = format!("{:?}", worker.status);
+                let rep_header = SetWorkerStatusResponse {
+                    worker: ProtoUtils::worker_info_to_pb(worker.clone()),
+                    status,
+                };
+                return ctx.response_buf(rep_header, &mut self.buf);
+            }
+        }
+
+        err_box!("worker not found or not manageable: {}", req.worker)
+    }
+
     pub fn worker_heartbeat(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         let mut wm = self.fs.worker_manager.write();
@@ -657,7 +696,11 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         !matches!(
             code,
-            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+            RpcCode::SubmitJob
+                | RpcCode::GetJobStatus
+                | RpcCode::ListJobStatus
+                | RpcCode::CancelJob
+                | RpcCode::ReportTask
         )
     }
 
@@ -709,6 +752,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
+            RpcCode::SetWorkerStatus => self.set_worker_status(ctx),
 
             RpcCode::ReportBlockReplicationResult => {
                 if let Some(ref mut replication_service) = self.replication_handler {
@@ -758,6 +802,7 @@ impl MessageHandler for MasterHandler {
         let res = match code {
             RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx, &mut self.buf).await,
             RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
+            RpcCode::ListJobStatus => self.job_handler.list_load_status(ctx, &mut self.buf),
             RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
             RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),
 

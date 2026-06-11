@@ -207,6 +207,16 @@ message GetMasterInfoRequest {
 
 }
 
+message SetWorkerStatusRequest {
+    required string worker = 1;
+    required string status = 2;
+}
+
+message SetWorkerStatusResponse {
+    required WorkerInfoProto worker = 1;
+    required string status = 2;
+}
+
 message GetMasterInfoResponse {
     required string active_master = 1;
     repeated string journal_nodes = 2;

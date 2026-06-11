@@ -13,18 +13,26 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::JobTaskState;
+use curvine_client::rpc::{JobListOptions, JobMasterClient};
+use curvine_common::state::{JobStatus, JobTaskState, LoadTaskStatus};
 use orpc::CommonResult;
 
 use crate::util::*;
 
 #[derive(Parser, Debug)]
 pub struct LoadStatusCommand {
-    job_id: String,
+    job_id: Option<String>,
+
+    /// Query the newest job whose source or target path matches this prefix.
+    #[arg(long)]
+    path: Option<String>,
 
     #[arg(long, short = 'v')]
     verbose: bool,
+
+    /// When verbose is enabled, only print failed task details.
+    #[arg(long, alias = "failed_only")]
+    failed_only: bool,
 
     #[arg(long, short = 'w', default_value = "5s")]
     watch: Option<String>,
@@ -36,21 +44,53 @@ pub struct LoadStatusCommand {
 impl LoadStatusCommand {
     pub fn new(job_id: String, verbose: bool, watch: String, conf: String) -> Self {
         Self {
-            job_id,
+            job_id: Some(job_id),
+            path: None,
             verbose,
+            failed_only: false,
             watch: Some(watch),
             conf,
         }
     }
     pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
-        println!("\n Checking status for {}", self.job_id);
+        if self.job_id.is_none() && self.path.is_none() {
+            eprintln!("Error: provide a job_id or --path <cv-or-ufs-path>");
+            std::process::exit(1);
+        }
 
         if let Some(watch_interval) = &self.watch {
             self.watch_status(client, watch_interval).await
         } else {
-            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
-            println!("{}", status);
+            let status = self.fetch_status(&client).await;
+            print_job_status(&status, self.verbose, self.failed_only);
             Ok(())
+        }
+    }
+
+    async fn fetch_status(&self, client: &JobMasterClient) -> JobStatus {
+        if let Some(job_id) = &self.job_id {
+            if self.verbose {
+                handle_rpc_result(client.get_job_status_verbose(job_id)).await
+            } else {
+                handle_rpc_result(client.get_job_status(job_id)).await
+            }
+        } else {
+            let path = self.path.as_deref().expect("path checked by execute");
+            let mut jobs =
+                handle_rpc_result(client.list_job_statuses_with_options(JobListOptions {
+                    path_prefix: Some(path.to_string()),
+                    limit: 1,
+                    include_finished: true,
+                    include_tasks: self.verbose,
+                    failed_only: self.failed_only,
+                    ..Default::default()
+                }))
+                .await;
+            if jobs.is_empty() {
+                eprintln!("Error: no load job found for path prefix {}", path);
+                std::process::exit(1);
+            }
+            jobs.remove(0)
         }
     }
 
@@ -82,15 +122,20 @@ impl LoadStatusCommand {
                 print!("\x1B[2J\x1B[1;1H");
             }
 
+            let target = self
+                .job_id
+                .as_deref()
+                .or(self.path.as_deref())
+                .unwrap_or("<unknown>");
             println!(
                 "\n Checking status for {} (refreshing every {})",
-                self.job_id,
+                target,
                 format_duration(&duration)
             );
             println!("Press Ctrl+C to stop watching.");
 
-            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
-            println!("{}", status);
+            let status = self.fetch_status(&client).await;
+            print_job_status(&status, self.verbose, self.failed_only);
 
             if status.state == JobTaskState::Completed
                 || status.state == JobTaskState::Failed
@@ -104,4 +149,96 @@ impl LoadStatusCommand {
 
         Ok(())
     }
+}
+
+pub(crate) fn parse_job_state(value: &str) -> Option<JobTaskState> {
+    match value.to_ascii_lowercase().as_str() {
+        "pending" => Some(JobTaskState::Pending),
+        "loading" | "running" => Some(JobTaskState::Loading),
+        "completed" | "complete" | "done" => Some(JobTaskState::Completed),
+        "failed" | "fail" => Some(JobTaskState::Failed),
+        "canceled" | "cancelled" | "cancel" => Some(JobTaskState::Canceled),
+        "unknown" => Some(JobTaskState::UNKNOWN),
+        _ => None,
+    }
+}
+
+pub(crate) fn print_job_table(jobs: &[JobStatus]) {
+    if jobs.is_empty() {
+        println!("No load jobs found.");
+        return;
+    }
+    println!(
+        "{:<34} {:<12} {:<10} {:>6} {:>6} {:>6} {:>6}  {:<40} -> {}",
+        "JOB_ID", "SOURCE_TYPE", "STATE", "TOTAL", "DONE", "FAIL", "RUN", "SOURCE", "TARGET"
+    );
+    for job in jobs {
+        println!(
+            "{:<34} {:<12} {:<10} {:>6} {:>6} {:>6} {:>6}  {:<40} -> {}",
+            job.job_id,
+            job.source_type.as_str(),
+            format!("{:?}", job.state),
+            job.total_files,
+            job.completed_files,
+            job.failed_files,
+            job.running_files,
+            truncate(&job.source_path, 40),
+            job.target_path
+        );
+    }
+}
+
+pub(crate) fn print_job_status(status: &JobStatus, verbose: bool, failed_only: bool) {
+    println!("{}", status);
+    println!("Source: {}", status.source_type.as_str());
+    println!(
+        "Files: total={}, completed={}, failed={}, pending={}, loading={}, running={}",
+        status.total_files,
+        status.completed_files,
+        status.failed_files,
+        status.pending_files,
+        status.loading_files,
+        status.running_files
+    );
+    if verbose {
+        print_task_table(&status.tasks, failed_only);
+    }
+}
+
+pub(crate) fn print_task_table(tasks: &[LoadTaskStatus], failed_only: bool) {
+    // When filtering to failures but no task actually failed (e.g. a job that
+    // failed at dispatch with tasks left Pending), fall back to showing all
+    // tasks so the failure context is not hidden behind "No task details found".
+    let has_failed = tasks.iter().any(|task| task.state == JobTaskState::Failed);
+    let rows = tasks
+        .iter()
+        .filter(|task| !failed_only || !has_failed || task.state == JobTaskState::Failed)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        println!("No task details found.");
+        return;
+    }
+    println!(
+        "{:<34} {:<10} {:<24} {:<36} {:<36} MESSAGE",
+        "TASK_ID", "STATE", "WORKER", "SOURCE", "TARGET"
+    );
+    for task in rows {
+        println!(
+            "{:<34} {:<10} {:<24} {:<36} {:<36} {}",
+            task.task_id,
+            format!("{:?}", task.state),
+            truncate(&task.worker, 24),
+            truncate(&task.source_path, 36),
+            truncate(&task.target_path, 36),
+            task.progress.message
+        );
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    format!("{}…", value.chars().take(keep).collect::<String>())
 }

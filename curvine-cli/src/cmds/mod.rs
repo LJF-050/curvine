@@ -15,6 +15,7 @@
 mod fs;
 mod load;
 mod load_cancel;
+mod load_list;
 mod load_status;
 mod mount;
 mod node;
@@ -24,6 +25,7 @@ mod umount;
 pub use fs::FsCommand;
 pub use load::LoadCommand;
 pub use load_cancel::CancelLoadCommand;
+pub use load_list::LoadListCommand;
 pub use load_status::LoadStatusCommand;
 pub use mount::MountCommand;
 pub use node::NodeCommand;

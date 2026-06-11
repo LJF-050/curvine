@@ -371,6 +371,39 @@ where
         Ok(())
     }
 
+    fn handle_transfer_leader(&mut self, env: Envelope) -> RaftResult<()> {
+        if !self.is_leader() {
+            return Self::send_not_leader(self.leader(), env, &self.group);
+        }
+
+        let header: TransferLeaderRequest = env.msg.parse_header()?;
+        if header.target_id == self.id() {
+            let error =
+                RaftError::other(format!("node {} is already leader", header.target_id).into());
+            let rep_msg = env.msg.error_ext(&error);
+            env.send_with_log(Ok(rep_msg));
+            return Ok(());
+        }
+        if self.group.get_addr(&header.target_id).is_none() {
+            let error =
+                RaftError::other(format!("target node {} does not exist", header.target_id).into());
+            let rep_msg = env.msg.error_ext(&error);
+            env.send_with_log(Ok(rep_msg));
+            return Ok(());
+        }
+
+        let previous_leader_id = self.id();
+        self.raw.transfer_leader(header.target_id);
+        let msg = Builder::success(&env.msg)
+            .proto_header(TransferLeaderResponse {
+                previous_leader_id,
+                target_id: header.target_id,
+            })
+            .build();
+        env.send_with_log(Ok(msg));
+        Ok(())
+    }
+
     fn handle(&mut self, env: Envelope, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
         let code = RaftCode::from(env.msg.code());
         //info!("receive: {:?} {:?}", code, env.msg);
@@ -382,6 +415,8 @@ where
             RaftCode::Propose => self.handle_propose(env, promise),
 
             RaftCode::Ping => self.handle_ping(env),
+
+            RaftCode::TransferLeader => self.handle_transfer_leader(env),
 
             _ => {
                 let ext = env
@@ -471,8 +506,9 @@ where
                 self.group.get_addr_string(self.id()),
             );
 
-            self.storage.role_change(ss.raft_state).await?;
             let to_follower = self.role_monitor.is_leader() && !self.is_leader();
+            self.storage.role_change(ss.raft_state).await?;
+            self.role_monitor.advance_role(&ss);
             if to_follower {
                 Self::install_snapshot(
                     &self.storage.log_store,
@@ -481,8 +517,6 @@ where
                 )
                 .await?;
             }
-
-            self.role_monitor.advance_role(&ss);
         } else {
             // Determine whether a snapshot is needed.
             self.apply_create_snapshot()?;

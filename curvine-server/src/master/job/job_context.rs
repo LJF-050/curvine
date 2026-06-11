@@ -84,6 +84,7 @@ impl JobContext {
             mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
             overwrite: job_conf.overwrite,
+            source_type: job_conf.source_type.unwrap_or_default(),
         };
 
         JobContext {

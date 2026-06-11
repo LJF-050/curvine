@@ -17,7 +17,6 @@ use std::sync::Arc;
 use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
-use curvine_web::server::{WebHandlerService, WebServer};
 use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
@@ -29,7 +28,6 @@ use orpc::CommonResult;
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
-use crate::master::router_handler::MasterRouterHandler;
 use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
@@ -105,18 +103,9 @@ impl HandlerService for MasterService {
     }
 }
 
-impl WebHandlerService for MasterService {
-    type Item = MasterRouterHandler;
-
-    fn get_handler(&self) -> Self::Item {
-        MasterRouterHandler::new(self.conf.clone(), self.fs.clone())
-    }
-}
-
 pub struct Master {
     pub start_time: u64,
     rpc_server: RpcServer<MasterService>,
-    web_server: WebServer<MasterService>,
     journal_system: JournalSystem,
     actor: MasterActor,
     mount_manager: Arc<MountManager>,
@@ -170,14 +159,9 @@ impl Master {
         let rpc_conf = conf.master_server_conf();
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
 
-        // step4: Create a web server
-        let web_conf = conf.master_web_conf();
-        let web_server = WebServer::new(web_conf, service);
-
         Ok(Self {
             start_time: LocalTime::mills(),
             rpc_server,
-            web_server,
             journal_system,
             actor,
             mount_manager,
@@ -199,19 +183,16 @@ impl Master {
         let mut rpc_status = self.rpc_server.start();
         rpc_status.wait_running().await.unwrap();
 
-        // step3: Start the web server
-        self.web_server.start();
-
-        // step4: Start master actor
+        // step3: Start master actor
         self.actor.start();
 
         // reload mount info
         self.mount_manager.restore();
 
-        // step5: Start job manager
+        // step4: Start job manager
         self.job_manager.start();
 
-        // step6: Start TTL scheduler (requires mount_manager and job_manager)
+        // step5: Start TTL scheduler (requires mount_manager and job_manager)
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
         }

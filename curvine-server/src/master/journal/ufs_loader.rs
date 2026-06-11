@@ -20,7 +20,7 @@ use curvine_client::unified::MountValue;
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{JobTaskState, LoadJobCommand};
+use curvine_common::state::{JobSourceType, JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::DurationUnit;
@@ -62,7 +62,9 @@ impl UfsLoader {
     }
 
     pub async fn submit_load_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
-        let command = LoadJobCommand::builder(path.clone_uri()).build();
+        let command = LoadJobCommand::builder(path.clone_uri())
+            .source_type(JobSourceType::FsModeAuto)
+            .build();
         let runner = self.job_manager.create_runner();
         let res = match runner.submit_load_task(command, mnt.info.clone()).await {
             Ok(res) => res,
@@ -75,6 +77,7 @@ impl UfsLoader {
                 };
             }
         };
+        self.job_manager.record_submitted();
 
         if matches!(res.state, JobTaskState::Completed) {
             return Ok(());

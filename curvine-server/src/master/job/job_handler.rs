@@ -15,9 +15,10 @@
 use crate::master::{JobManager, RpcContext};
 use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
-    SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
+    ListJobStatusRequest, ListJobStatusResponse, LoadTaskStatusProto, SubmitJobRequest,
+    SubmitJobResponse, TaskReportRequest, TaskReportResponse,
 };
-use curvine_common::state::LoadJobCommand;
+use curvine_common::state::{JobStatus, JobTaskState, LoadJobCommand, LoadTaskStatus};
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -32,6 +33,41 @@ pub struct JobHandler {
 }
 
 impl JobHandler {
+    fn task_status_response(task: LoadTaskStatus) -> LoadTaskStatusProto {
+        LoadTaskStatusProto {
+            task_id: task.task_id,
+            source_path: task.source_path,
+            target_path: task.target_path,
+            worker: task.worker,
+            state: task.state as i32,
+            progress: ProtoUtils::work_progress_to_pb(task.progress),
+            create_time: task.create_time,
+            update_time: task.update_time,
+        }
+    }
+
+    fn job_status_response(status: JobStatus) -> GetJobStatusResponse {
+        GetJobStatusResponse {
+            job_id: status.job_id,
+            state: status.state as i32,
+            source_path: status.source_path,
+            target_path: status.target_path,
+            progress: ProtoUtils::work_progress_to_pb(status.progress),
+            total_files: Some(status.total_files),
+            completed_files: Some(status.completed_files),
+            failed_files: Some(status.failed_files),
+            running_files: Some(status.running_files),
+            pending_files: Some(status.pending_files),
+            loading_files: Some(status.loading_files),
+            source_type: Some(i32::from(status.source_type)),
+            tasks: status
+                .tasks
+                .into_iter()
+                .map(Self::task_status_response)
+                .collect(),
+        }
+    }
+
     /// Create a new Master Loading Task Service
     pub fn new(job_manager: Arc<JobManager>) -> Self {
         Self { job_manager }
@@ -76,16 +112,42 @@ impl JobHandler {
         let req: GetJobStatusRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.job_id.clone()), None);
 
-        let status = self.job_manager.get_job_status(&req.job_id)?;
-        let response = GetJobStatusResponse {
-            job_id: status.job_id,
-            state: status.state as i32,
-            source_path: status.source_path,
-            target_path: status.target_path,
-            progress: ProtoUtils::work_progress_to_pb(status.progress),
-        };
+        let status =
+            self.job_manager
+                .get_job_status_with_options(&req.job_id, req.verbose, false)?;
+        let response = Self::job_status_response(status);
 
         ctx.response_buf(response, buf)
+    }
+
+    pub fn list_load_status(
+        &self,
+        ctx: &mut RpcContext<'_>,
+        buf: &mut FrameBuf,
+    ) -> FsResult<Message> {
+        let req: ListJobStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(req.path_prefix.clone(), None);
+        let limit = req.limit.unwrap_or(100) as usize;
+        let include_finished = req.include_finished.unwrap_or(true);
+        let state_filter = req.state.map(|state| JobTaskState::from(state as i8));
+        let include_tasks = req.include_tasks.unwrap_or(false);
+        let failed_only = req.failed_only.unwrap_or(false);
+        let offset = req.offset.unwrap_or(0) as usize;
+        let statuses = self.job_manager.list_job_statuses_filtered(
+            req.path_prefix.as_deref(),
+            limit,
+            include_finished,
+            state_filter,
+            req.mount_path.as_deref(),
+            include_tasks,
+            failed_only,
+            offset,
+        );
+        let jobs = statuses
+            .into_iter()
+            .map(Self::job_status_response)
+            .collect();
+        ctx.response_buf(ListJobStatusResponse { jobs }, buf)
     }
 
     /// Cancel the loading task

@@ -20,10 +20,12 @@ use tokio::time;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
-    SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
+    ListJobStatusRequest, ListJobStatusResponse, SubmitJobRequest, SubmitJobResponse,
+    TaskReportRequest, TaskReportResponse,
 };
 use curvine_common::state::{
-    JobStatus, JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobResult,
+    JobSourceType, JobStatus, JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand,
+    LoadJobResult, LoadTaskStatus,
 };
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
@@ -36,6 +38,33 @@ use crate::file::{FsClient, FsContext};
 #[derive(Clone)]
 pub struct JobMasterClient {
     client: Arc<FsClient>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobListOptions {
+    pub path_prefix: Option<String>,
+    pub limit: usize,
+    pub include_finished: bool,
+    pub state: Option<JobTaskState>,
+    pub mount_path: Option<String>,
+    pub include_tasks: bool,
+    pub failed_only: bool,
+    pub offset: usize,
+}
+
+impl Default for JobListOptions {
+    fn default() -> Self {
+        Self {
+            path_prefix: None,
+            limit: 100,
+            include_finished: true,
+            state: None,
+            mount_path: None,
+            include_tasks: false,
+            failed_only: false,
+            offset: 0,
+        }
+    }
 }
 
 impl JobMasterClient {
@@ -68,22 +97,103 @@ impl JobMasterClient {
         })
     }
 
-    /// Get loading task status according to the path
-    pub async fn get_job_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
-        let req = GetJobStatusRequest {
-            job_id: job_id.as_ref().to_string(),
-            verbose: false,
-        };
+    fn task_status_from_pb(task: curvine_common::proto::LoadTaskStatusProto) -> LoadTaskStatus {
+        LoadTaskStatus {
+            task_id: task.task_id,
+            source_path: task.source_path,
+            target_path: task.target_path,
+            worker: task.worker,
+            state: JobTaskState::from(task.state as i8),
+            progress: ProtoUtils::work_progress_from_pb(task.progress),
+            create_time: task.create_time,
+            update_time: task.update_time,
+        }
+    }
 
-        let status: GetJobStatusResponse = self.client.rpc(RpcCode::GetJobStatus, req).await?;
-
-        Ok(JobStatus {
+    fn job_status_from_pb(status: GetJobStatusResponse) -> JobStatus {
+        JobStatus {
             job_id: status.job_id,
             state: JobTaskState::from(status.state as i8),
             source_path: status.source_path,
             target_path: status.target_path,
             progress: ProtoUtils::work_progress_from_pb(status.progress),
+            total_files: status.total_files.unwrap_or_default(),
+            completed_files: status.completed_files.unwrap_or_default(),
+            failed_files: status.failed_files.unwrap_or_default(),
+            running_files: status.running_files.unwrap_or_default(),
+            pending_files: status.pending_files.unwrap_or_default(),
+            loading_files: status.loading_files.unwrap_or_default(),
+            source_type: status
+                .source_type
+                .map(JobSourceType::from)
+                .unwrap_or_default(),
+            tasks: status
+                .tasks
+                .into_iter()
+                .map(Self::task_status_from_pb)
+                .collect(),
+        }
+    }
+
+    /// Get loading task status according to the path
+    pub async fn get_job_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
+        self.get_job_status_with_options(job_id, false, false).await
+    }
+
+    pub async fn get_job_status_verbose(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
+        self.get_job_status_with_options(job_id, true, false).await
+    }
+
+    pub async fn get_job_status_with_options(
+        &self,
+        job_id: impl AsRef<str>,
+        verbose: bool,
+        _failed_only: bool,
+    ) -> FsResult<JobStatus> {
+        let req = GetJobStatusRequest {
+            job_id: job_id.as_ref().to_string(),
+            verbose,
+        };
+
+        let status: GetJobStatusResponse = self.client.rpc(RpcCode::GetJobStatus, req).await?;
+        Ok(Self::job_status_from_pb(status))
+    }
+
+    pub async fn list_job_statuses(
+        &self,
+        path_prefix: Option<&str>,
+        limit: usize,
+        include_finished: bool,
+    ) -> FsResult<Vec<JobStatus>> {
+        self.list_job_statuses_with_options(JobListOptions {
+            path_prefix: path_prefix.map(|value| value.to_string()),
+            limit,
+            include_finished,
+            ..Default::default()
         })
+        .await
+    }
+
+    pub async fn list_job_statuses_with_options(
+        &self,
+        options: JobListOptions,
+    ) -> FsResult<Vec<JobStatus>> {
+        let req = ListJobStatusRequest {
+            path_prefix: options.path_prefix,
+            limit: Some(options.limit as u32),
+            include_finished: Some(options.include_finished),
+            state: options.state.map(|state| state as i32),
+            mount_path: options.mount_path,
+            include_tasks: Some(options.include_tasks),
+            failed_only: Some(options.failed_only),
+            offset: Some(options.offset as u32),
+        };
+        let response: ListJobStatusResponse = self.client.rpc(RpcCode::ListJobStatus, req).await?;
+        Ok(response
+            .jobs
+            .into_iter()
+            .map(Self::job_status_from_pb)
+            .collect())
     }
 
     /// Cancel the loading task

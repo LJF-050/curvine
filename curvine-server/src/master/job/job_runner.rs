@@ -284,13 +284,13 @@ impl LoadJobRunner {
 
                 // Calculate target_path based on source and target types
                 let target_path = if source_path.is_cv() && !target_base.is_cv() {
-                    // Export: Curvine → UFS
+                    // Export: Curvine ? UFS
                     mnt.get_ufs_path(&source_path)?
                 } else if !source_path.is_cv() && target_base.is_cv() {
-                    // Import: UFS → Curvine
+                    // Import: UFS ? Curvine
                     mnt.get_cv_path(&source_path)?
                 } else {
-                    // Same type (Curvine→Curvine or UFS→UFS), not supported yet
+                    // Same type (Curvine?Curvine or UFS?UFS), not supported yet
                     return err_box!(
                         "Unsupported path combination: source={}, target={}",
                         source_path.full_path(),

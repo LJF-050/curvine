@@ -147,130 +147,85 @@ impl NodeCommand {
         Ok(())
     }
 
-    // Extract hostnames from node addresses (hostname:port format)
-    fn extract_hostnames(&self, nodes: &[String]) -> Vec<String> {
-        nodes
-            .iter()
-            .map(|node| {
-                // Split by ':' and take the first part (hostname)
-                node.split(':').next().unwrap_or(node).to_string()
-            })
-            .collect()
-    }
-
-    // Process decommission operation results
-    fn process_decommission_results(
-        &self,
-        result: &[String],
-        requested_nodes: &[String],
+    fn print_worker_status_results(
+        successful: &[String],
+        failed: &[(String, String)],
         operation_type: &str,
     ) {
-        if result.is_empty() {
-            println!("No worker was {} decommission list", operation_type);
-            return;
-        }
-
-        // Create a map of requested nodes for quick lookup
-        let mut requested_map = HashMap::new();
-        for node in requested_nodes {
-            let hostname = node.split(':').next().unwrap_or(node);
-            requested_map.insert(hostname.to_string(), node.clone());
-        }
-
-        // Track successful and failed operations
-        let mut successful = Vec::new();
-        let mut failed = Vec::new();
-
-        // Process successful operations
-        for worker in result {
-            // Extract worker_id and hostname:port from worker info
-            let parts: Vec<&str> = worker.split(',').collect();
-            if parts.len() >= 2 {
-                let addr_part = parts[1].to_string();
-                successful.push(addr_part);
-            }
-        }
-
-        // Identify failed operations
-        for (hostname, full_node) in &requested_map {
-            let found = result.iter().any(|worker| {
-                let parts: Vec<&str> = worker.split(',').collect();
-                if parts.len() >= 2 {
-                    let worker_hostname = parts[1].split(':').next().unwrap_or("");
-                    worker_hostname == hostname
-                } else {
-                    false
-                }
-            });
-
-            if !found {
-                failed.push(full_node.clone());
-            }
-        }
-
-        // Print successful operations
         if !successful.is_empty() {
             println!("Successfully {} workers:", operation_type);
-            for addr in &successful {
+            for addr in successful {
                 println!("  {}", addr);
             }
             println!("Total: {} worker(s)", successful.len());
         }
 
-        // Print failed operations
         if !failed.is_empty() {
             println!("Failed to {} workers:", operation_type);
-            for addr in &failed {
-                println!("  {}", addr);
+            for (addr, err) in failed {
+                println!("  {} ({})", addr, err);
             }
             println!("Total: {} worker(s)", failed.len());
         }
+
+        if successful.is_empty() && failed.is_empty() {
+            println!("No workers were {} decommission list", operation_type);
+        }
+    }
+
+    async fn set_workers_status(
+        &self,
+        client: Arc<FsClient>,
+        status: &str,
+        operation_type: &str,
+    ) -> CommonResult<()> {
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+
+        for node in &self.nodes {
+            let worker = node.trim();
+            if worker.is_empty() {
+                continue;
+            }
+
+            match client.set_worker_status(worker, status).await {
+                Ok((info, applied_status)) => successful.push(format!(
+                    "{}:{} ({})",
+                    info.address.hostname, info.address.rpc_port, applied_status
+                )),
+                Err(err) => {
+                    let hostname = worker.split(':').next().unwrap_or(worker);
+                    if hostname != worker {
+                        match client.set_worker_status(hostname, status).await {
+                            Ok((info, applied_status)) => successful.push(format!(
+                                "{}:{} ({})",
+                                info.address.hostname, info.address.rpc_port, applied_status
+                            )),
+                            Err(retry_err) => {
+                                failed.push((worker.to_string(), retry_err.to_string()))
+                            }
+                        }
+                    } else {
+                        failed.push((worker.to_string(), err.to_string()));
+                    }
+                }
+            }
+        }
+
+        Self::print_worker_status_results(&successful, &failed, operation_type);
+        Ok(())
     }
 
     // Handle adding workers to decommission list
-    async fn handle_add_decommission(
-        &self,
-        client: Arc<FsClient>,
-        conf: &ClusterConf,
-    ) -> CommonResult<()> {
-        // Extract hostname from hostname:port format
-        let worker_hostnames = self.extract_hostnames(&self.nodes);
-        let workers = worker_hostnames.join(",");
-
-        // Call add-dcm API
-        let url = format!("/add-dcm?workers={}", workers);
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, &url)).await;
-
-        // Parse response
-        let result: Vec<String> = serde_json::from_str(&response)?;
-
-        // Process and display results
-        self.process_decommission_results(&result, &self.nodes, "added to");
-
-        Ok(())
+    async fn handle_add_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        self.set_workers_status(client, "Decommission", "added to")
+            .await
     }
 
     // Handle removing workers from decommission list
-    async fn handle_remove_decommission(
-        &self,
-        client: Arc<FsClient>,
-        conf: &ClusterConf,
-    ) -> CommonResult<()> {
-        // Extract hostname from hostname:port format
-        let worker_hostnames = self.extract_hostnames(&self.nodes);
-        let workers = worker_hostnames.join(",");
-
-        // Call remove-dcm API
-        let url = format!("/remove-dcm?workers={}", workers);
-        let response = handle_rpc_result(self.http_get(client.clone(), conf, &url)).await;
-
-        // Parse response
-        let result: Vec<String> = serde_json::from_str(&response)?;
-
-        // Process and display results
-        self.process_decommission_results(&result, &self.nodes, "removed from");
-
-        Ok(())
+    async fn handle_remove_decommission(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        self.set_workers_status(client, "Live", "removed from")
+            .await
     }
 
     pub async fn execute(&self, client: Arc<FsClient>, conf: ClusterConf) -> CommonResult<()> {
@@ -279,11 +234,11 @@ impl NodeCommand {
         }
 
         if self.add_decommission {
-            return self.handle_add_decommission(client, &conf).await;
+            return self.handle_add_decommission(client).await;
         }
 
         if self.remove_decommission {
-            return self.handle_remove_decommission(client, &conf).await;
+            return self.handle_remove_decommission(client).await;
         }
 
         Ok(())

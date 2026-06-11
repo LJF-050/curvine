@@ -2248,8 +2248,11 @@ name = "curvine-web"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "bytes",
+ "clap",
  "curvine-client",
  "curvine-common",
+ "futures",
  "log",
  "orpc",
  "serde",
@@ -2257,6 +2260,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",
+ "uuid",
 ]
 
 [[package]]
