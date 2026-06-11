@@ -1,143 +1,173 @@
-<!--
-  - Copyright 2025 OPPO.
-  -
-  - Licensed under the Apache License, Version 2.0 (the "License");
-  - you may not use this file except in compliance with the License.
-  - You may obtain a copy of the License at
-  -
-  -     http://www.apache.org/licenses/LICENSE-2.0
-  -
-  - Unless required by applicable law or agreed to in writing, software
-  - distributed under the License is distributed on an "AS IS" BASIS,
-  - WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  - See the License for the specific language governing permissions and
-  - limitations under the License.
-  -->
-
 <template>
-  <div v-loading="loading" class="configuration-page">
-    <div class="container-fluid">
-      <div class="row">
-        <div class="col-6">
-          <h5>Curvine Configuration</h5>
-        </div>
-        <div class=" search-container col-6">
-          <input id="searchConfig" placeholder="Search by Property" type="text" class="form-control"
-            v-model="searchQuery">
-        </div>
-        <div class="col-12">
-          <table class="table table-hover">
-            <thead>
-              <tr>
-                <th>Property</th>
-                <th>Value</th>
-              </tr>
-            </thead>
-            <template v-if="filteredData.length > 0">
-              <tbody v-for="item in filteredData" :key="item.key">
-                <tr>
-                  <td>
-                    <pre class="mb-0"><code>{{ item.key }}</code></pre>
-                  </td>
-                  <td>{{ item.value }}</td>
-                </tr>
-              </tbody>
-            </template>
-            <tbody v-else-if="searchQuery">
-              <tr>
-                <td> not found matched properties.</td>
-              </tr>
-            </tbody>
-          </table>
+  <div class="admin-page" v-loading="loading">
+    <section class="metric-grid">
+      <MetricCard label="Entries" :value="filteredConfig.length" meta="matching current filter" delta="readonly" tone="good" />
+      <MetricCard label="Groups" :value="groups.length" meta="top-level prefixes" delta="auto" tone="neutral" />
+      <MetricCard label="Settings" :value="configItems.length" meta="loaded config values" delta="cluster" tone="good" />
+      <MetricCard label="API" value="/api/v1" meta="preferred endpoint" delta="enabled" tone="good" />
+    </section>
+
+    <section class="admin-panel table-panel">
+      <div class="panel-heading config-heading">
+        <div>
+          <h2>Configuration</h2>
+          <p>Searchable readonly cluster configuration</p>
         </div>
       </div>
-    </div>
+
+      <div class="config-toolbar">
+        <label class="config-field">
+          Search
+          <input v-model="query" class="admin-input config-search" placeholder="Search by property name">
+        </label>
+        <label class="config-field">
+          Group
+          <select v-model="groupFilter" class="admin-input config-select">
+            <option value="all">All groups ({{ configItems.length }})</option>
+            <option v-for="group in groups" :key="group" :value="group">{{ group }} ({{ groupCount(group) }})</option>
+          </select>
+        </label>
+      </div>
+
+      <table class="admin-table config-table">
+        <thead>
+          <tr><th>Property</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in filteredConfig" :key="item.key">
+            <td><strong>{{ item.key }}</strong></td>
+            <td><pre v-if="item.multiline" class="config-value-block">{{ item.value }}</pre><span v-else>{{ item.value }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="filteredConfig.length === 0" class="empty-state">No configuration matched.</div>
+    </section>
   </div>
 </template>
 
 <script>
+import MetricCard from '@/components/admin/MetricCard.vue'
 import { fetchConfigData } from '@/api/client'
 import eventBus from '@/utils/eventBus'
 
-/* eslint-disable vue/multi-word-component-names */
 export default {
-  name: 'Config',
-  components: {
-  },
+  name: 'ConfigPage',
+  components: { MetricCard },
   data() {
     return {
       loading: false,
-      data: [],
-      searchQuery: ''
+      configItems: [],
+      query: '',
+      groupFilter: 'all'
     }
-  },
-  created() {
-    this.fetchData()
-  },
-  mounted() {
-    // Listen for auto refresh events
-    eventBus.on('auto-refresh-trigger', this.handleAutoRefresh)
-  },
-  beforeUnmount() {
-    // Clean up event listeners
-    eventBus.off('auto-refresh-trigger', this.handleAutoRefresh)
   },
   computed: {
-    filteredData() {
-      return this.data.filter(item => item.key.toLowerCase().includes(this.searchQuery.toLowerCase()))
-    }
-  },
-  methods: {
-    /**
-     * Handle auto refresh trigger from header component
-     */
-    handleAutoRefresh() {
-      this.fetchData()
+    groups() {
+      return [...new Set(this.configItems.map((item) => this.groupOf(item.key)).filter(Boolean))].sort()
     },
-    
-    /**
-     * Fetch configuration data from API
-     */
-    fetchData() {
-      this.loading = true
-      this.data = [] // Clear existing data
-      fetchConfigData().then(res => {
-        this.flattenData(res.data)
-        this.loading = false
-      }).catch(err => {
-        console.error("fetch config data error: " + err)
-        this.loading = false
+    filteredConfig() {
+      const q = this.query.toLowerCase()
+      return this.configItems.filter((item) => {
+        const matchedGroup = this.groupFilter === 'all' || this.groupOf(item.key) === this.groupFilter
+        return matchedGroup && item.key.toLowerCase().includes(q)
       })
-    },
-    
-    /**
-     * Flatten nested configuration object into key-value pairs
-     */
-    flattenData(data, parentKey = "") {
-      for (let key in data) {
-        if (Object.prototype.hasOwnProperty.call(data, key)) {
-          let propName = parentKey ? `${parentKey}.${key}` : key;
-          if (typeof data[key] === 'object' && !Array.isArray(data[key])) {
-            this.flattenData(data[key], propName);
-          } else {
-            // this.data[propName] = data[key];
-            this.data.push({ 'key': propName, 'value': data[key] })
-          }
-        }
-      }
     }
   },
+  created() { this.fetchData() },
+  mounted() { eventBus.on('admin-refresh', this.fetchData) },
+  beforeUnmount() { eventBus.off('admin-refresh', this.fetchData) },
+  methods: {
+    async fetchData() {
+      this.loading = true
+      try {
+        const data = await fetchConfigData()
+        this.configItems = []
+        this.flattenData(data || {})
+      } finally { this.loading = false }
+    },
+    groupOf(key) { return String(key || '').split('.')[0] },
+    groupCount(group) { return this.configItems.filter((item) => this.groupOf(item.key) === group).length },
+    formatValue(value) {
+      if (Array.isArray(value)) {
+        if (value.length === 0) return { value: '[]', multiline: false }
+        const lines = value.map((item) => this.formatArrayItem(item))
+        return { value: lines.join('\n'), multiline: lines.length > 1 || lines.some((line) => line.length > 80) }
+      }
+      if (value && typeof value === 'object') return { value: JSON.stringify(value), multiline: false }
+      if (value === null || value === undefined) return { value: '', multiline: false }
+      return { value: String(value), multiline: false }
+    },
+    formatArrayItem(item) {
+      if (!item || typeof item !== 'object') return String(item)
+      if ('hostname' in item && 'port' in item) {
+        const prefix = 'id' in item ? `${item.id}: ` : ''
+        return `${prefix}${item.hostname}:${item.port}`
+      }
+      return Object.entries(item).map(([key, value]) => `${key}=${value}`).join(', ')
+    },
+    flattenData(data, parent = '') {
+      Object.keys(data || {}).forEach((key) => {
+        const name = parent ? `${parent}.${key}` : key
+        const value = data[key]
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          this.flattenData(value, name)
+        } else {
+          const formatted = this.formatValue(value)
+          this.configItems.push({ key: name, value: formatted.value, multiline: formatted.multiline })
+        }
+      })
+    }
+  }
 }
 </script>
 
-<style lang="scss">
-#searchConfig {
-  width: 50%;
-  margin-left: 50%;
+<style scoped>
+.config-heading {
+  margin-bottom: 12px;
 }
 
-.search-container {
-  align-content: center;
-  bottom: 5px;
+.config-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(220px, 320px);
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #edf4e9;
+}
+
+.config-field {
+  display: grid;
+  gap: 5px;
+  color: var(--admin-muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.config-search,
+.config-select {
+  width: 100%;
+  height: 38px;
+}
+
+.config-table {
+  table-layout: fixed;
+}
+
+.config-table th:first-child,
+.config-table td:first-child {
+  width: 38%;
+}
+
+.config-table td {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+@media (max-width: 900px) {
+  .config-toolbar {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

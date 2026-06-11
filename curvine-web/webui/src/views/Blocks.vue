@@ -1,84 +1,12 @@
-<!--
-  - Copyright 2025 OPPO.
-  -
-  - Licensed under the Apache License, Version 2.0 (the "License");
-  - you may not use this file except in compliance with the License.
-  - You may obtain a copy of the License at
-  -
-  -     http://www.apache.org/licenses/LICENSE-2.0
-  -
-  - Unless required by applicable law or agreed to in writing, software
-  - distributed under the License is distributed on an "AS IS" BASIS,
-  - WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  - See the License for the specific language governing permissions and
-  - limitations under the License.
-  -->
-
 <template>
-  <div v-loading="loading" class="block-page">
-    <div class="container-fluid">
-      <div class="row">
-        <div class="col-6">
-          <h5>File Block Locations</h5>
-        </div>
-        <div class="col-12">
-          <table class="table table-hover">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Block Size</th>
-                <th>File Type</th>
-                <th>Storage Type</th>
-                <th>Locations</th>
-              </tr>
-            </thead>
-            <tbody v-for="item in data" :key="item">
-              <tr>
-                <td>{{ item.block.id }}</td>
-                <td>{{ item.block.block_size }}</td>
-                <td>{{ item.block.file_type }}</td>
-                <td>{{ item.block.storage_type }}</td>
-                <td>{{ item.locs }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+  <div class="admin-page" v-loading="loading">
+    <section class="admin-panel table-panel"><div class="panel-heading table-heading"><div><h2>Block Locations</h2><p>Inspect block placement for {{ path }}</p></div><button class="admin-button ghost compact" @click="$router.push({ path: '/browse', query: { path } })">Back</button></div><div class="path-toolbar"><input v-model="path" class="admin-input path-input" placeholder="/path/to/file" @keyup.enter="fetchData"><button class="admin-button primary compact" @click="fetchData">Inspect</button></div><pre class="json-view">{{ formattedBlocks }}</pre></section>
   </div>
 </template>
 
 <script>
 import { fetchBlocksData } from '@/api/client'
+import eventBus from '@/utils/eventBus'
 
-/* eslint-disable vue/multi-word-component-names */
-export default {
-  name: 'Blocks',
-  components: {
-  },
-  data() {
-    return {
-      loading: false,
-      data: [],
-      path: this.$route.query.path
-    }
-  },
-  created() {
-    this.loading = true
-    fetchBlocksData({ path: this.path }).then(res => {
-      let block_ids = res.data.block_ids
-      for (const block_id of block_ids) {
-        let block = res.data.block_locs[block_id].block
-        let locations = res.data.block_locs[block_id].locs
-        this.data.push({
-          "block": block,
-          "locs": locations.map(item => item.hostname + "_" + item.rpc_port).join(", ")
-        })
-      }
-    }).catch(err => {
-      console.error("fetch block data error: " + err)
-    })
-    this.loading = false
-  },
-}
+export default { name: 'BlocksPage', data() { return { loading: false, path: this.$route.query.path || '/', blocks: null } }, computed: { formattedBlocks() { return JSON.stringify(this.blocks || {}, null, 2) } }, created() { this.fetchData() }, mounted() { eventBus.on('admin-refresh', this.fetchData) }, beforeUnmount() { eventBus.off('admin-refresh', this.fetchData) }, methods: { async fetchData() { if (!this.path) return; this.loading = true; try { this.blocks = await fetchBlocksData({ path: this.path }) } finally { this.loading = false } } } }
 </script>

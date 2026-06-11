@@ -19,6 +19,7 @@ const { defineConfig } = require('@vue/cli-service')
 module.exports = defineConfig({
   transpileDependencies: true,
   devServer: {
+    historyApiFallback: true,
     proxy: {
       '/api': {
         target: (process.env.VUE_APP_BASE_URL || "http://localhost:8080") + process.env.VUE_APP_BASE_API, // target API server

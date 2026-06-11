@@ -15,30 +15,22 @@
   -->
 
 <template>
-    <div className="loadingMessageWrapper">
-        <div className="loadingMessage text-center">
-            <img className="loadingMessageSpin" src="@/assets/curvine.svg" />
+    <div class="loadingMessageWrapper">
+        <div class="loadingMessage text-center">
+            <img class="loadingMessageSpin" src="@/assets/curvine.svg" />
             <br />
-            <h5 className="">Please wait...</h5>
+            <h5 class="">Please wait...</h5>
         </div>
     </div>
 </template>
 
 <script>
 export default {
-    name: "HelloWorld",
-    onMounted() {
-        document.body.style.overflow = "hidden";
-    },
-    onUnmounted() {
-        document.body.style.overflow = ""
-    },
+    name: "LoadingOverlay"
 }
 </script>
 
 <style lang="scss">
-@import "~bootswatch/dist/darkly/variables";
-
 .loadingMessageWrapper {
     position: fixed;
     top: 33%;
@@ -48,8 +40,8 @@ export default {
         position: relative;
         left: -50%;
         padding: 1em 1.5em;
-        color: $gray-400;
-        background-color: $light;
+        color: #6a7865;
+        background-color: #ffffff;
         border-radius: 1em;
 
         img.loadingMessageSpin {
