@@ -14,4 +14,6 @@
 
 mod web_server;
 
+mod admin_web_service;
+pub use self::admin_web_service::AdminWebService;
 pub use self::web_server::{WebHandlerService, WebServer};

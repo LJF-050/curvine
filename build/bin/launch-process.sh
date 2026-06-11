@@ -58,6 +58,13 @@ start() {
       --service ${SERVICE_NAME} \
       --conf ${CURVINE_CONF_FILE} \
       > ${OUT_FILE} 2>&1 < /dev/null  &
+     elif [[ "$SERVICE_NAME" = "web" ]]; then
+       name="curvine-web"
+       nohup ${CURVINE_HOME}/lib/curvine-web \
+       start \
+       --conf ${CURVINE_CONF_FILE} \
+       $PARAMS \
+       > ${OUT_FILE} 2>&1 < /dev/null  &
      elif [[ "$SERVICE_NAME" = "fuse" ]]; then
        name="curvine-fuse"
        nohup ${CURVINE_HOME}/lib/curvine-fuse \

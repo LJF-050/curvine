@@ -13,6 +13,8 @@
 // limitations under the License.
 
 // pub mod load_handler;
+pub mod admin_handler;
 mod router_handler;
 
+pub use self::admin_handler::AdminRouterHandler;
 pub use self::router_handler::{RouterHandler, TestHandler};

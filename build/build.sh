@@ -352,6 +352,11 @@ if should_build_package "cli"; then
   COPY_TARGETS+=("curvine-cli")
 fi
 
+if should_build_package "web"; then
+  RUST_BUILD_ARGS+=("-p" "curvine-web")
+  COPY_TARGETS+=("curvine-web")
+fi
+
 # Add optional rust packages
 if should_build_package "fuse" && [ -n "$FUSE_VERSION" ]; then
   RUST_BUILD_ARGS+=("-p" "curvine-fuse")
@@ -423,8 +428,8 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
     done
   fi
 
-  # Add UFS features if we're building client
-  if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]]; then
+  # Add UFS features if we're building a client-linked component.
+  if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]] || [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-web " ]]; then
     for ufs in "${UFS_TYPES[@]}"; do
       case $ufs in
         oss-hdfs)

@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
-use axum::http::StatusCode;
+use axum::http::{header, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Json;
 use log::{error, info};
 use orpc::io::net::{InetAddr, NetUtils};
@@ -33,6 +36,61 @@ use tower_http::trace::TraceLayer;
 use crate::router::{RouterHandler, TestHandler};
 
 const WEBUI_DIR: &str = "webui";
+
+fn should_disable_cache(path: &str) -> bool {
+    path == "/"
+        || path == "/index.html"
+        || (!path.starts_with("/api/")
+            && !path.starts_with("/assets/")
+            && !path.starts_with("/css/")
+            && !path.starts_with("/js/")
+            && !path.starts_with("/img/")
+            && !path.ends_with(".ico")
+            && !path.ends_with(".svg"))
+}
+
+async fn no_cache_spa_entry(req: Request<Body>, next: Next) -> Response {
+    let disable_cache = should_disable_cache(req.uri().path());
+    let mut response = next.run(req).await;
+    if disable_cache {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static(
+                "no-store, no-cache, must-revalidate, proxy-revalidate",
+            ),
+        );
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+        response
+            .headers_mut()
+            .insert(header::EXPIRES, header::HeaderValue::from_static("0"));
+    }
+    response
+}
+
+fn webui_dir() -> PathBuf {
+    if let Ok(path) = env::var("CURVINE_WEBUI_DIR") {
+        let path = PathBuf::from(path);
+        if path.join("index.html").exists() {
+            return path;
+        }
+    }
+
+    for path in [
+        Path::new(WEBUI_DIR),
+        Path::new("curvine-web/webui/dist"),
+        Path::new("curvine-web/webui"),
+        Path::new("/workspace/curvine-web/webui/dist"),
+        Path::new("/workspace/curvine-web/webui"),
+    ] {
+        if path.join("index.html").exists() {
+            return path.to_path_buf();
+        }
+    }
+
+    PathBuf::from(WEBUI_DIR)
+}
 
 pub trait WebHandlerService {
     type Item: RouterHandler + 'static;
@@ -109,8 +167,8 @@ where
             "WebServer [{}] start successfully, bind address: {}",
             self.conf.name, self.address,
         );
-        let webui_path = Path::new(WEBUI_DIR);
-        let serve_dir = ServeDir::new(webui_path)
+        let webui_path = webui_dir();
+        let serve_dir = ServeDir::new(webui_path.clone())
             .not_found_service(ServeFile::new(webui_path.join("index.html")));
         let app = self
             .service
@@ -120,6 +178,7 @@ where
             .layer(
                 ServiceBuilder::new()
                     .layer(TraceLayer::new_for_http())
+                    .layer(middleware::from_fn(no_cache_spa_entry))
                     .layer(HandleErrorLayer::new(|e| async move {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
