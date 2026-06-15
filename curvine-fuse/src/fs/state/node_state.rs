@@ -31,7 +31,7 @@ use log::{error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
-use orpc::sys::RawPtr;
+use orpc::sys::{RawPtr, SysUtils};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Mutex;
 
@@ -544,9 +544,20 @@ impl NodeState {
     }
 
     pub fn set_metrics(&self, m: &FuseMetrics) {
-        m.inode_num.set(self.node_read().nodes_len() as i64);
-        m.file_handle_num.set(self.file_handles_len() as i64);
-        m.dir_handle_num.set(self.dir_handles_len() as i64);
+        let inode_count = self.node_read().nodes_len() as i64;
+        let file_handle_count = self.file_handles_len() as i64;
+        let dir_handle_count = self.dir_handles_len() as i64;
+        let used_memory = SysUtils::used_memory() as i64;
+
+        m.inode_num.set(inode_count);
+        m.file_handle_num.set(file_handle_count);
+        m.dir_handle_num.set(dir_handle_count);
+        m.fuse_used_memory_bytes.set(used_memory);
+
+        m.inode_count.set(inode_count);
+        m.file_handle_count.set(file_handle_count);
+        m.dir_handle_count.set(dir_handle_count);
+        m.used_memory_bytes.set(used_memory);
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {

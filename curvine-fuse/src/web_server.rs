@@ -3,9 +3,10 @@ use crate::FuseMetrics;
 use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
-use orpc::common::Metrics;
+use orpc::common::{elapsed_us, Metrics};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct WebServer;
 
@@ -26,7 +27,13 @@ impl WebServer {
 }
 
 async fn metrics_handler(State(state): State<Arc<NodeState>>) -> String {
+    let start = Instant::now();
     let fuse_metrics = FuseMetrics::get();
     state.set_metrics(fuse_metrics);
-    Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e))
+    let output = Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e));
+    fuse_metrics
+        .metrics_scrape_duration_us
+        .observe(elapsed_us(start));
+    fuse_metrics.metrics_scrape_bytes.set(output.len() as i64);
+    output
 }

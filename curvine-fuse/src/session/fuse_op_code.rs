@@ -68,3 +68,86 @@ pub enum FuseOpCode {
 
     CUSE_INIT = 4096,
 }
+
+impl FuseOpCode {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            FuseOpCode::NOT_SUPPORTED => "NotSupported",
+            FuseOpCode::FUSE_LOOKUP => "Lookup",
+            FuseOpCode::FUSE_FORGET => "Forget",
+            FuseOpCode::FUSE_GETATTR => "GetAttr",
+            FuseOpCode::FUSE_SETATTR => "SetAttr",
+            FuseOpCode::FUSE_READLINK => "Readlink",
+            FuseOpCode::FUSE_SYMLINK => "Symlink",
+            FuseOpCode::FUSE_MKNOD => "MkNod",
+            FuseOpCode::FUSE_MKDIR => "Mkdir",
+            FuseOpCode::FUSE_UNLINK => "Unlink",
+            FuseOpCode::FUSE_RMDIR => "RmDir",
+            FuseOpCode::FUSE_RENAME => "Rename",
+            FuseOpCode::FUSE_LINK => "Link",
+            FuseOpCode::FUSE_OPEN => "Open",
+            FuseOpCode::FUSE_READ => "Read",
+            FuseOpCode::FUSE_WRITE => "Write",
+            FuseOpCode::FUSE_STATFS => "StatFs",
+            FuseOpCode::FUSE_RELEASE => "Release",
+            FuseOpCode::FUSE_FSYNC => "FSync",
+            FuseOpCode::FUSE_SETXATTR => "SetXAttr",
+            FuseOpCode::FUSE_GETXATTR => "GetXAttr",
+            FuseOpCode::FUSE_LISTXATTR => "ListXAttr",
+            FuseOpCode::FUSE_REMOVEXATTR => "RemoveXAttr",
+            FuseOpCode::FUSE_FLUSH => "Flush",
+            FuseOpCode::FUSE_INIT => "Init",
+            FuseOpCode::FUSE_OPENDIR => "OpenDir",
+            FuseOpCode::FUSE_READDIR => "ReadDir",
+            FuseOpCode::FUSE_RELEASEDIR => "ReleaseDir",
+            FuseOpCode::FUSE_FSYNCDIR => "FSyncDir",
+            FuseOpCode::FUSE_GETLK => "GetLk",
+            FuseOpCode::FUSE_SETLK => "SetLk",
+            FuseOpCode::FUSE_SETLKW => "SetLkW",
+            FuseOpCode::FUSE_ACCESS => "Access",
+            FuseOpCode::FUSE_CREATE => "Create",
+            FuseOpCode::FUSE_INTERRUPT => "Interrupt",
+            FuseOpCode::FUSE_BMAP => "Bmap",
+            FuseOpCode::FUSE_DESTROY => "Destroy",
+            FuseOpCode::FUSE_IOCTL => "Ioctl",
+            FuseOpCode::FUSE_POLL => "Poll",
+            FuseOpCode::FUSE_NOTIFY_REPLY => "NotifyReply",
+            FuseOpCode::FUSE_BATCH_FORGET => "BatchForget",
+            FuseOpCode::FUSE_FALLOCATE => "FAllocate",
+            FuseOpCode::FUSE_READDIRPLUS => "ReadDirPlus",
+            FuseOpCode::FUSE_RENAME2 => "Rename2",
+            FuseOpCode::FUSE_LSEEK => "Lseek",
+            FuseOpCode::CUSE_INIT => "CuseInit",
+        }
+    }
+
+    pub fn kind_label(self) -> &'static str {
+        match self {
+            FuseOpCode::FUSE_READ
+            | FuseOpCode::FUSE_WRITE
+            | FuseOpCode::FUSE_FLUSH
+            | FuseOpCode::FUSE_RELEASE
+            | FuseOpCode::FUSE_FSYNC => "stream",
+            _ => "metadata",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseOpCode;
+
+    #[test]
+    fn opcode_labels_are_static_and_bounded() {
+        assert_eq!(FuseOpCode::FUSE_READ.as_label(), "Read");
+        assert_eq!(FuseOpCode::FUSE_LOOKUP.as_label(), "Lookup");
+        assert_eq!(FuseOpCode::NOT_SUPPORTED.as_label(), "NotSupported");
+    }
+
+    #[test]
+    fn opcode_kind_matches_stream_ops() {
+        assert_eq!(FuseOpCode::FUSE_READ.kind_label(), "stream");
+        assert_eq!(FuseOpCode::FUSE_WRITE.kind_label(), "stream");
+        assert_eq!(FuseOpCode::FUSE_LOOKUP.kind_label(), "metadata");
+    }
+}

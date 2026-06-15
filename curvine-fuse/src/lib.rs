@@ -28,7 +28,7 @@ mod fuse_error;
 pub use self::fuse_error::FuseError;
 
 pub mod fuse_metrics;
-pub use self::fuse_metrics::FuseMetrics;
+pub use self::fuse_metrics::{FuseMetrics, FuseReplyMetrics};
 
 mod fuse_utils;
 pub use self::fuse_utils::FuseUtils;

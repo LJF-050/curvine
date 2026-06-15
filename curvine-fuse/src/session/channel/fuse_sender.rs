@@ -14,14 +14,16 @@
 
 use crate::fs::FileSystem;
 use crate::session::{FuseTask, ResponseData};
-use crate::FuseResult;
+use crate::{FuseMetrics, FuseResult};
 use log::{error, info, warn};
+use orpc::common::elapsed_us;
 use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// FuseSender
 /// Reads data from queue and writes to fuse fd.
@@ -63,10 +65,17 @@ impl<T: FileSystem> FuseSender<T> {
     }
 
     pub async fn start(mut self) -> FuseResult<()> {
+        FuseMetrics::get()
+            .sender_tasks
+            .with_label_values(&["running"])
+            .inc();
         while let Some(task) = self.receiver.recv().await {
             match task {
                 FuseTask::Reply(reply) => {
                     let id = reply.header.unique;
+                    if reply.metrics.is_some() {
+                        FuseMetrics::get().reply_queue_depth.dec();
+                    }
                     if let Err(e) = self.send(reply).await {
                         if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
                             warn!("error send unique {}: {}", id, e);
@@ -79,6 +88,10 @@ impl<T: FileSystem> FuseSender<T> {
                 }
             }
         }
+        FuseMetrics::get()
+            .sender_tasks
+            .with_label_values(&["running"])
+            .dec();
         Ok(())
     }
 
@@ -87,7 +100,13 @@ impl<T: FileSystem> FuseSender<T> {
         if self.debug {
             info!("reply {:?}", rep.header);
         }
-        self.splice(rep).await
+        let metrics = rep.metrics.clone();
+        let start = Instant::now();
+        let res = self.splice(rep).await;
+        if let Some(metrics) = metrics {
+            FuseMetrics::get().observe_reply(&metrics, elapsed_us(start), res.is_ok());
+        }
+        res
     }
 
     pub async fn write(&mut self, rep: ResponseData) -> IOResult<()> {

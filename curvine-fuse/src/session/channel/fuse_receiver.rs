@@ -16,9 +16,10 @@ use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseRequest, FuseResponse, FuseTask};
-use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
+use crate::{err_fuse, FuseMetrics, FuseResult, FUSE_IN_HEADER_LEN};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info};
+use orpc::common::elapsed_us;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
@@ -26,6 +27,7 @@ use orpc::sync::FastDashMap;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{watch, Notify};
 use tokio_util::bytes::BytesMut;
 
@@ -120,8 +122,14 @@ impl<T: FileSystem> FuseReceiver<T> {
         Ok(req_buf)
     }
 
-    pub fn new_replay(&self, unique: u64) -> FuseResponse {
-        FuseResponse::new(unique, self.sender.clone(), self.debug)
+    pub fn new_replay(&self, req: &FuseRequest, request_start: Instant) -> FuseResponse {
+        FuseResponse::new(
+            req.unique(),
+            req.opcode(),
+            request_start,
+            self.sender.clone(),
+            self.debug,
+        )
     }
 
     fn audit(&self, req: &FuseRequest) {
@@ -138,9 +146,23 @@ impl<T: FileSystem> FuseReceiver<T> {
         );
     }
 
-    pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
-        let operator = req.parse_operator()?;
-        let rep = self.new_replay(req.unique());
+    pub async fn send_stream(&self, req: FuseRequest, request_start: Instant) -> FuseResult<()> {
+        let operation_start = Instant::now();
+        let operator = match req.parse_operator() {
+            Ok(v) => v,
+            Err(e) => {
+                self.new_replay(&req, request_start)
+                    .with_operation_start(operation_start)
+                    .send_rep::<(), _>(Err(e))
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let rep = self
+            .new_replay(&req, request_start)
+            .with_operation_start(operation_start);
+        let error_reply = rep.clone();
         let res = match operator {
             FuseOperator::Read(op) => self.fs.read(op, rep).await,
 
@@ -152,42 +174,81 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::FSync(op) => self.fs.fsync(op, rep).await,
 
-            _ => err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode()),
+            _ => {
+                FuseMetrics::get()
+                    .unsupported_total
+                    .with_label_values(&[req.opcode().as_label()])
+                    .inc();
+                err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode())
+            }
         };
 
         if res.is_err() {
-            self.new_replay(req.unique()).send_rep(res).await?;
+            error_reply.send_rep(res).await?;
         }
         Ok(())
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
         debug!("fuse receiver started");
+        FuseMetrics::get()
+            .receiver_tasks
+            .with_label_values(&["running"])
+            .inc();
         loop {
+            let receive_start = Instant::now();
             tokio::select! {
                 res = self.receive() => {
                     match res {
                         Ok(buf) => {
-                            let req = FuseRequest::from_bytes(buf.freeze())?;
+                            let receive_us = elapsed_us(receive_start);
+                            let parse_start = Instant::now();
+                            let req = match FuseRequest::from_bytes(buf.freeze()) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    FuseMetrics::get().observe_stage(
+                                        "parse",
+                                        "framework",
+                                        "error",
+                                        elapsed_us(parse_start),
+                                    );
+                                    return Err(e.into());
+                                }
+                            };
+                            let kind = req.opcode().kind_label();
+                            FuseMetrics::get().observe_stage("receive", kind, "success", receive_us);
+                            FuseMetrics::get().observe_stage(
+                                "parse",
+                                kind,
+                                "success",
+                                elapsed_us(parse_start),
+                            );
+                            FuseMetrics::get()
+                                .inflight_requests
+                                .with_label_values(&[kind])
+                                .inc();
+                            let request_start = Instant::now();
 
                             if self.debug {
-                                let operator = req.parse_operator()?;
-                                info!(
-                                    "receive unique: {}, code: {:?}, op: {:?}",
-                                    req.unique(),
-                                    req.opcode(),
-                                    operator
-                                );
+                                match req.parse_operator() {
+                                    Ok(operator) => info!(
+                                        "receive unique: {}, code: {:?}, op: {:?}",
+                                        req.unique(),
+                                        req.opcode(),
+                                        operator
+                                    ),
+                                    Err(e) => error!("failed to parse debug operator: {}", e),
+                                }
                             }
 
                             if req.is_stream() {
-                                if let Err(e) = self.send_stream(req).await {
+                                if let Err(e) = self.send_stream(req, request_start).await {
                                     error!("failed to dispatch stream request: {}", e);
                                 }
                             } else {
                                 self.audit(&req);
 
-                                let reply = self.new_replay(req.unique());
+                                let reply = self.new_replay(&req, request_start);
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
                                 self.rt.spawn(async move {
@@ -203,7 +264,15 @@ impl<T: FileSystem> FuseReceiver<T> {
                             Some(EINTR) => continue,
                             Some(EAGAIN) => continue,
                             Some(ENODEV) => break,
-                            _ => return Err(e.into()),
+                            _ => {
+                                FuseMetrics::get().observe_stage(
+                                    "receive",
+                                    "framework",
+                                    "error",
+                                    elapsed_us(receive_start),
+                                );
+                                return Err(e.into());
+                            },
                         },
                     }
                 }
@@ -217,6 +286,10 @@ impl<T: FileSystem> FuseReceiver<T> {
             }
         }
 
+        FuseMetrics::get()
+            .receiver_tasks
+            .with_label_values(&["running"])
+            .dec();
         Ok(())
     }
 
@@ -232,15 +305,22 @@ impl<T: FileSystem> FuseReceiver<T> {
 
         let notify = Arc::new(Notify::new());
         pending_requests.insert(req.unique(), notify.clone());
+        FuseMetrics::get().pending_interruptible_requests.inc();
 
         let res = tokio::select! {
             result = Self::dispatch_meta(&pending_requests, &fs, &req, &reply) => {
                 pending_requests.remove(&req.unique());
+                FuseMetrics::get().pending_interruptible_requests.dec();
                 result
             }
 
             _ = notify.notified() => {
                 pending_requests.remove(&req.unique());
+                FuseMetrics::get().pending_interruptible_requests.dec();
+                FuseMetrics::get()
+                    .interrupted_total
+                    .with_label_values(&[req.opcode().as_label()])
+                    .inc();
                 let err: FuseResult<()> = err_fuse!(EINTR, "operation interrupted");
                 reply.send_rep(err).await.map_err(|x| x.into())
             }
@@ -255,7 +335,14 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: &FuseRequest,
         reply: &FuseResponse,
     ) -> FuseResult<()> {
-        let operator = req.parse_operator()?;
+        let reply = reply.clone().with_operation_start(Instant::now());
+        let operator = match req.parse_operator() {
+            Ok(v) => v,
+            Err(e) => {
+                reply.send_rep::<(), _>(Err(e)).await?;
+                return Ok(());
+            }
+        };
 
         let res = match operator {
             FuseOperator::Init(op) => reply.send_rep(fs.init(op).await).await,
@@ -335,6 +422,10 @@ impl<T: FileSystem> FuseReceiver<T> {
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
             _ => {
+                FuseMetrics::get()
+                    .unsupported_total
+                    .with_label_values(&[req.opcode().as_label()])
+                    .inc();
                 let err: FuseResult<fuse_out_header> =
                     err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode());
                 reply.send_rep(err).await

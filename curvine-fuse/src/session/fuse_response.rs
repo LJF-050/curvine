@@ -18,26 +18,38 @@ use crate::raw::fuse_abi::{
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
 };
 use crate::session::{FuseNotifyCode, FuseOpCode, FuseTask};
-use crate::{FuseError, FuseResult, FuseUtils};
+use crate::{FuseError, FuseMetrics, FuseReplyMetrics, FuseResult, FuseUtils};
 use crate::{FUSE_MAX_NAME_LENGTH, FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use log::{info, warn};
+use orpc::common::{elapsed_us, errno_label, status_label};
 use orpc::io::IOResult;
 use orpc::sync::channel::AsyncSender;
 use orpc::sys::DataSlice;
 use orpc::ternary;
 use std::fmt::Debug;
 use std::io::IoSlice;
+use std::time::Instant;
 use std::vec;
 use tokio_util::bytes::BytesMut;
 
 pub struct ResponseData {
     pub header: fuse_out_header,
     pub data: Vec<DataSlice>,
+    pub metrics: Option<FuseReplyMetrics>,
 }
 
 impl ResponseData {
     pub fn new(header: fuse_out_header, data: Vec<DataSlice>) -> Self {
-        Self { header, data }
+        Self {
+            header,
+            data,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: FuseReplyMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn len(&self) -> u32 {
@@ -83,15 +95,34 @@ pub struct FuseResponse {
     pub(crate) unique: u64,
     pub(crate) sender: AsyncSender<FuseTask>,
     pub(crate) debug: bool,
+    opcode: FuseOpCode,
+    kind: &'static str,
+    request_start: Instant,
+    operation_start: Instant,
 }
 
 impl FuseResponse {
-    pub fn new(unique: u64, sender: AsyncSender<FuseTask>, debug: bool) -> Self {
+    pub fn new(
+        unique: u64,
+        opcode: FuseOpCode,
+        request_start: Instant,
+        sender: AsyncSender<FuseTask>,
+        debug: bool,
+    ) -> Self {
         Self {
             unique,
             sender,
             debug,
+            opcode,
+            kind: opcode.kind_label(),
+            request_start,
+            operation_start: request_start,
         }
+    }
+
+    pub fn with_operation_start(mut self, operation_start: Instant) -> Self {
+        self.operation_start = operation_start;
+        self
     }
 
     pub fn unique(&self) -> u64 {
@@ -102,6 +133,39 @@ impl FuseResponse {
         if self.debug || !matches!(e.errno, libc::ENOENT | libc::ENODATA | libc::ENOSYS) {
             warn!("send_rep unique {}: {}", self.unique, e);
         }
+    }
+
+    fn reply_metrics(&self, errno: Option<i32>) -> FuseReplyMetrics {
+        let ok = errno.is_none();
+        FuseReplyMetrics {
+            opcode: self.opcode.as_label(),
+            kind: self.kind,
+            status: status_label(ok),
+            errno: errno.map(errno_label),
+            request_start: self.request_start,
+            operation_duration_us: elapsed_us(self.operation_start),
+        }
+    }
+
+    async fn send_reply_data(&self, data: ResponseData) -> IOResult<()> {
+        let metrics = data.metrics.clone();
+        let enqueue_start = Instant::now();
+        let res = self.sender.send(FuseTask::Reply(data)).await;
+        if let Some(metrics) = metrics {
+            let fuse_metrics = FuseMetrics::get();
+            fuse_metrics.observe_stage(
+                "reply_enqueue",
+                metrics.kind,
+                metrics.status,
+                elapsed_us(enqueue_start),
+            );
+            if res.is_ok() {
+                fuse_metrics.reply_queue_depth.inc();
+            } else {
+                fuse_metrics.observe_enqueue_failure(&metrics);
+            }
+        }
+        res
     }
 
     pub async fn send_rep<T: Debug, E: Into<FuseError> + Debug>(
@@ -120,16 +184,18 @@ impl FuseResponse {
                     vec![DataSlice::buffer(FuseUtils::struct_as_buf(&v))]
                 };
                 ResponseData::create(self.unique, FUSE_SUCCESS, data)
+                    .with_metrics(self.reply_metrics(None))
             }
 
             Err(e) => {
                 let e = e.into();
                 self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
+                    .with_metrics(self.reply_metrics(Some(e.errno)))
             }
         };
 
-        self.sender.send(FuseTask::Reply(data)).await
+        self.send_reply_data(data).await
     }
 
     pub async fn send_notify(&self, code: FuseNotifyCode, data: Vec<DataSlice>) -> IOResult<()> {
@@ -148,15 +214,17 @@ impl FuseResponse {
                     info!("send_buf unique {}, data len: {}", self.unique, v.len());
                 }
                 ResponseData::create(self.unique, FUSE_SUCCESS, vec![DataSlice::Buffer(v)])
+                    .with_metrics(self.reply_metrics(None))
             }
 
             Err(e) => {
                 self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
+                    .with_metrics(self.reply_metrics(Some(e.errno)))
             }
         };
 
-        self.sender.send(FuseTask::Reply(data)).await
+        self.send_reply_data(data).await
     }
 
     pub async fn send_data(&self, res: FuseResult<Vec<DataSlice>>) -> IOResult<()> {
@@ -167,18 +235,23 @@ impl FuseResponse {
                     info!("send_data unique {}, data len: {}", self.unique, len);
                 }
                 ResponseData::create(self.unique, FUSE_SUCCESS, v)
+                    .with_metrics(self.reply_metrics(None))
             }
 
             Err(e) => {
                 self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
+                    .with_metrics(self.reply_metrics(Some(e.errno)))
             }
         };
 
-        self.sender.send(FuseTask::Reply(data)).await
+        self.send_reply_data(data).await
     }
 
-    pub fn send_none(&self, _: FuseResult<()>) -> IOResult<()> {
+    pub fn send_none(&self, res: FuseResult<()>) -> IOResult<()> {
+        let errno = res.err().map(|e| e.errno);
+        let metrics = self.reply_metrics(errno);
+        FuseMetrics::get().observe_no_reply(&metrics);
         Ok(())
     }
 
