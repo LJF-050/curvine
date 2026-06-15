@@ -39,6 +39,9 @@ pub use self::byte_unit::ByteUnit;
 mod metrics;
 pub use self::metrics::*;
 
+mod observability;
+pub use self::observability::*;
+
 mod logger_format;
 pub use self::logger_format::LogFormatter;
 
