@@ -22,12 +22,14 @@ use curvine_common::state::*;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::ClusterConnector;
+use orpc::common::elapsed_us;
 use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct FsClient {
@@ -553,19 +555,50 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
-        self.connector
+        let method = code.to_string();
+        let metrics = FsContext::get_metrics();
+        metrics
+            .rpc_inflight_requests
+            .with_label_values(&["master", method.as_str()])
+            .inc();
+        let start = Instant::now();
+        let res = self
+            .connector
             .proto_rpc::<T, R, FsError>(code, header)
-            .await
+            .await;
+        metrics
+            .rpc_inflight_requests
+            .with_label_values(&["master", method.as_str()])
+            .dec();
+        metrics.observe_rpc("master", method.as_str(), &res, elapsed_us(start));
+        res
     }
 
     pub async fn rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
         let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
+        let method = code.to_string();
+        let metrics = FsContext::get_metrics();
+        metrics
+            .rpc_inflight_requests
+            .with_label_values(&["master", method.as_str()])
+            .inc();
+        let start = Instant::now();
 
-        let msg = self.connector.rpc::<FsError>(msg).await?;
-        match msg.header {
-            None => Ok(BytesMut::new()),
-            Some(v) => Ok(v),
+        let res = async {
+            let msg = self.connector.rpc::<FsError>(msg).await?;
+            match msg.header {
+                None => Ok(BytesMut::new()),
+                Some(v) => Ok(v),
+            }
         }
+        .await;
+
+        metrics
+            .rpc_inflight_requests
+            .with_label_values(&["master", method.as_str()])
+            .dec();
+        metrics.observe_rpc("master", method.as_str(), &res, elapsed_us(start));
+        res
     }
 
     pub fn rpc_blocking<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>

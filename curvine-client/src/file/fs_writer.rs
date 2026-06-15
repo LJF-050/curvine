@@ -18,10 +18,11 @@ use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::debug;
-use orpc::common::{ByteUnit, TimeSpent};
+use orpc::common::{elapsed_us, status_label, ByteUnit, TimeSpent};
 use orpc::sys::DataSlice;
 use orpc::{err_box, ternary};
 use std::sync::Arc;
+use std::time::Instant;
 
 type Inner = FsWriterBuffer;
 
@@ -73,6 +74,14 @@ impl FsWriter {
     pub fn file_blocks(&self) -> &FileBlocks {
         self.inner.file_blocks()
     }
+
+    fn path_type(path: &Path) -> &'static str {
+        if path.is_cv() {
+            "curvine"
+        } else {
+            "ufs"
+        }
+    }
 }
 
 impl Writer for FsWriter {
@@ -104,14 +113,37 @@ impl Writer for FsWriter {
         let len = chunk.len();
         let _timer =
             TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().write_time_us.clone()));
-        self.inner.write(chunk).await?;
+        let start = Instant::now();
+        let path_type = Self::path_type(self.path());
+        let res = self.inner.write(chunk).await;
+        let status = status_label(res.is_ok());
+        FsContext::get_metrics().observe_io(
+            "write",
+            path_type,
+            status,
+            if res.is_ok() { len } else { 0 },
+            elapsed_us(start),
+            Some(len),
+        );
+        if let Err(e) = &res {
+            FsContext::get_metrics().observe_io_error("write", path_type, e);
+        }
+        res?;
         FsContext::get_metrics().write_bytes.inc_by(len as i64);
         Ok(len as i64)
     }
 
     async fn flush(&mut self) -> FsResult<()> {
         self.flush_chunk().await?;
-        self.inner.flush().await
+        let start = Instant::now();
+        let path_type = Self::path_type(self.path());
+        let res = self.inner.flush().await;
+        let status = status_label(res.is_ok());
+        FsContext::get_metrics().observe_io("flush", path_type, status, 0, elapsed_us(start), None);
+        if let Err(e) = &res {
+            FsContext::get_metrics().observe_io_error("flush", path_type, e);
+        }
+        res
     }
 
     // Write is completed, perform the following operations
@@ -119,7 +151,22 @@ impl Writer for FsWriter {
     async fn complete(&mut self) -> FsResult<()> {
         self.flush_chunk().await?;
         // The flush operation will be automatically called internally, so flush is not needed here.
-        self.inner.complete().await
+        let start = Instant::now();
+        let path_type = Self::path_type(self.path());
+        let res = self.inner.complete().await;
+        let status = status_label(res.is_ok());
+        FsContext::get_metrics().observe_io(
+            "complete",
+            path_type,
+            status,
+            0,
+            elapsed_us(start),
+            None,
+        );
+        if let Err(e) = &res {
+            FsContext::get_metrics().observe_io_error("complete", path_type, e);
+        }
+        res
     }
 
     async fn cancel(&mut self) -> FsResult<()> {

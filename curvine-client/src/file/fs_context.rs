@@ -26,7 +26,7 @@ use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use orpc::client::{ClientConf, ClusterConnector};
-use orpc::common::Utils;
+use orpc::common::{RequestContext, RequestSource, Utils};
 use orpc::io::net::NetUtils;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -104,6 +104,10 @@ impl FsContext {
 
     pub fn clone_client_name(&self) -> String {
         self.client_addr.client_name.clone()
+    }
+
+    pub fn new_request_context(&self, source: RequestSource) -> RequestContext {
+        RequestContext::new_root(source)
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

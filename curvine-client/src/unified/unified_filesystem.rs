@@ -111,11 +111,20 @@ impl UnifiedFileSystem {
     where
         F: Future<Output = FsResult<T>>,
     {
+        self.metrics
+            .metadata_inflight_requests
+            .with_label_values(&[cmd])
+            .inc();
         let spent = TimeSpent::new();
         let res = fut.await;
         let used_us = spent.used_us();
+        self.metrics
+            .metadata_inflight_requests
+            .with_label_values(&[cmd])
+            .dec();
 
         self.op_metric(cmd, used_us);
+        self.metrics.observe_metadata(cmd, &res, used_us as f64);
         self.audit(cmd, src, dst, res, used_us)
     }
 
@@ -350,15 +359,24 @@ impl UnifiedFileSystem {
         let metrics = self.metrics;
 
         self.fs_context().rt().spawn(async move {
+            metrics
+                .metadata_inflight_requests
+                .with_label_values(&["SubmitJob"])
+                .inc();
             let time = TimeSpent::new();
             let command = LoadJobCommand::builder(source_path.clone()).build();
             let res = client.submit_load_job(command).await;
 
             let used_us = time.used_us();
             metrics
+                .metadata_inflight_requests
+                .with_label_values(&["SubmitJob"])
+                .dec();
+            metrics
                 .metadata_operation_duration
                 .with_label_values(&["SubmitJob"])
                 .observe(used_us as f64);
+            metrics.observe_metadata("SubmitJob", &res, used_us as f64);
 
             match res {
                 Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
@@ -371,7 +389,7 @@ impl UnifiedFileSystem {
                             true,
                             source_path,
                             res.target_path,
-                           used_us
+                            used_us
                         );
                     }
                 }
@@ -620,6 +638,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn open(&self, path: &Path) -> FsResult<UnifiedReader> {
+        self.metrics
+            .metadata_inflight_requests
+            .with_label_values(&["Open"])
+            .inc();
         let time = TimeSpent::new();
         let mut read_path = path.path().to_owned();
 
@@ -672,7 +694,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let res = fut.await;
 
         let used_us = time.used_us();
+        self.metrics
+            .metadata_inflight_requests
+            .with_label_values(&["Open"])
+            .dec();
         self.op_metric("Open", used_us);
+        self.metrics.observe_metadata("Open", &res, used_us as f64);
 
         self.audit("Open:R", &read_path, "", res, used_us)
     }

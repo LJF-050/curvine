@@ -17,10 +17,11 @@ use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::debug;
-use orpc::common::{ByteUnit, TimeSpent};
+use orpc::common::{elapsed_us, status_label, ByteUnit, TimeSpent};
 use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
+use std::time::Instant;
 
 type Inner = FsReaderBuffer;
 
@@ -69,6 +70,14 @@ impl FsReader {
     pub fn file_blocks(&self) -> &FileBlocks {
         &self.file_blocks
     }
+
+    fn path_type(path: &Path) -> &'static str {
+        if path.is_cv() {
+            "curvine"
+        } else {
+            "ufs"
+        }
+    }
 }
 
 impl Reader for FsReader {
@@ -103,7 +112,23 @@ impl Reader for FsReader {
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
         let _timer =
             TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().read_time_us.clone()));
-        self.inner.read().await
+        let start = Instant::now();
+        let path_type = Self::path_type(self.path());
+        let res = self.inner.read().await;
+        let status = status_label(res.is_ok());
+        let bytes = res.as_ref().map(|chunk| chunk.len()).unwrap_or(0);
+        FsContext::get_metrics().observe_io(
+            "read",
+            path_type,
+            status,
+            bytes,
+            elapsed_us(start),
+            Some(self.chunk_size()),
+        );
+        if let Err(e) = &res {
+            FsContext::get_metrics().observe_io_error("read", path_type, e);
+        }
+        res
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -126,7 +151,22 @@ impl Reader for FsReader {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
-        self.inner.complete().await
+        let start = Instant::now();
+        let path_type = Self::path_type(self.path());
+        let res = self.inner.complete().await;
+        let status = status_label(res.is_ok());
+        FsContext::get_metrics().observe_io(
+            "release",
+            path_type,
+            status,
+            0,
+            elapsed_us(start),
+            None,
+        );
+        if let Err(e) = &res {
+            FsContext::get_metrics().observe_io_error("release", path_type, e);
+        }
+        res
     }
 }
 
