@@ -23,6 +23,7 @@ use tokio_util::bytes::BytesMut;
 pub struct FuseDirentList {
     max_size: usize,
     buf: BytesMut,
+    entry_count: usize,
 }
 
 impl FuseDirentList {
@@ -31,11 +32,16 @@ impl FuseDirentList {
         Self {
             max_size,
             buf: BytesMut::with_capacity(max_size),
+            entry_count: 0,
         }
     }
 
     pub fn take(self) -> BytesMut {
         self.buf
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
     }
 
     pub fn add(&mut self, off: u64, status: &FileStatus, entry: fuse_entry_out) -> bool {
@@ -75,11 +81,15 @@ impl FuseDirentList {
         status: &FileStatus,
         entry: fuse_entry_out,
     ) -> bool {
-        if plus {
+        let added = if plus {
             self.add_plus(off, status, entry)
         } else {
             self.add(off, status, entry)
+        };
+        if added {
+            self.entry_count += 1;
         }
+        added
     }
 
     /// Add an entry to the buffer and return false if the buff is already full.

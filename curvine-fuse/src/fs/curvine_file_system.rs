@@ -28,12 +28,13 @@ use curvine_common::state::{
     MkdirOptsBuilder, OpenFlags, SetAttrOpts,
 };
 use log::{debug, error, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
+use orpc::common::{elapsed_us, status_label, ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
 use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
@@ -260,35 +261,52 @@ impl CurvineFileSystem {
         arg: &fuse_read_in,
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
-        let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
+        let start = Instant::now();
+        let result = async {
+            let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
 
-        let mut res = FuseDirentList::new(arg);
-        let mut index = arg.offset;
-        let mut batch = handle.get_batch(arg.offset as usize).await?;
-        {
-            let mut map = self.state.node_write();
-            while let Some(status) = batch.pop_front() {
-                let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
-                    if self.conf.enable_meta_cache {
-                        let path = Path::from_str(&status.path)?;
-                        self.state.meta_cache().put_status(&path, status.clone());
+            let mut res = FuseDirentList::new(arg);
+            let mut index = arg.offset;
+            let mut batch = handle.get_batch(arg.offset as usize).await?;
+            {
+                let mut map = self.state.node_write();
+                while let Some(status) = batch.pop_front() {
+                    let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
+                        if self.conf.enable_meta_cache {
+                            let path = Path::from_str(&status.path)?;
+                            self.state.meta_cache().put_status(&path, status.clone());
+                        }
+                        map.do_lookup(header.nodeid, Some(&status.name), &status)?
+                    } else {
+                        Self::status_to_attr(&self.conf, &status)?
+                    };
+
+                    let entry = Self::create_entry_out(&self.conf, attr);
+                    if !res.add_dirent(plus, index, &status, entry) {
+                        batch.push_front(status);
+                        break;
                     }
-                    map.do_lookup(header.nodeid, Some(&status.name), &status)?
-                } else {
-                    Self::status_to_attr(&self.conf, &status)?
-                };
-
-                let entry = Self::create_entry_out(&self.conf, attr);
-                if !res.add_dirent(plus, index, &status, entry) {
-                    batch.push_front(status);
-                    break;
+                    index += 1;
                 }
-                index += 1;
             }
-        }
-        handle.set_buf(batch).await?;
+            handle.set_buf(batch).await?;
 
-        Ok(res)
+            Ok(res)
+        }
+        .await;
+
+        let status = status_label(result.is_ok());
+        if let Ok(list) = &result {
+            FuseMetrics::get()
+                .readdir_entries_total
+                .with_label_values(&[status])
+                .inc_by(list.entry_count() as i64);
+        }
+        FuseMetrics::get()
+            .readdir_duration_us
+            .with_label_values(&[status])
+            .observe(elapsed_us(start));
+        result
     }
 
     async fn check_permissions(
@@ -545,8 +563,21 @@ impl CurvineFileSystem {
     async fn get_cached_status(&self, path: &Path) -> FuseResult<FileStatus> {
         if self.conf.enable_meta_cache {
             if let Some(status) = self.state.meta_cache().get_status(path) {
+                FuseMetrics::get()
+                    .node_cache_hits_total
+                    .with_label_values(&["meta"])
+                    .inc();
                 return Ok(status);
             }
+            FuseMetrics::get()
+                .node_cache_misses_total
+                .with_label_values(&["meta", "not_found"])
+                .inc();
+        } else {
+            FuseMetrics::get()
+                .node_cache_misses_total
+                .with_label_values(&["meta", "disabled"])
+                .inc();
         }
 
         let status = self.fs_get_status(path).await?;
@@ -584,9 +615,17 @@ impl CurvineFileSystem {
         }
 
         self.state.meta_cache().invalidate(path);
+        FuseMetrics::get()
+            .node_cache_invalidations_total
+            .with_label_values(&["meta"])
+            .inc();
 
         if let Ok(Some(parent)) = path.parent() {
             self.state.meta_cache().invalidate_list(&parent);
+            FuseMetrics::get()
+                .node_cache_invalidations_total
+                .with_label_values(&["meta_list"])
+                .inc();
         }
 
         Ok(())
@@ -1423,12 +1462,22 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn fsync(&self, op: FSync<'_>, reply: FuseResponse) -> FuseResult<()> {
-        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.flush(Some(reply)).await?;
+        let start = Instant::now();
+        let result = async {
+            let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+            handle.flush(Some(reply)).await?;
 
-        let path = Path::from_str(&handle.status.path)?;
-        self.invalidate_cache(&path)?;
-        Ok(())
+            let path = Path::from_str(&handle.status.path)?;
+            self.invalidate_cache(&path)?;
+            Ok(())
+        }
+        .await;
+        let status = status_label(result.is_ok());
+        FuseMetrics::get().observe_io("fsync", "unknown", status, 0, elapsed_us(start), None);
+        if result.is_err() {
+            FuseMetrics::get().observe_io_error("fsync", "unknown", "unknown");
+        }
+        result
     }
 
     /// Create a file system node (mknod system call)

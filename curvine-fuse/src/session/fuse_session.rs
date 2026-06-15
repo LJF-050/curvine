@@ -20,14 +20,14 @@ use crate::raw::fuse_abi::*;
 use crate::session::channel::{FuseChannel, FuseReceiver, FuseSender};
 use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
-use crate::{err_fuse, FuseResult};
+use crate::{err_fuse, FuseMetrics, FuseResult};
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::fs::{StateReader, StateWriter};
 use curvine_common::utils::CommonUtils;
 use curvine_common::version::GIT_VERSION;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
+use orpc::common::{elapsed_us, status_label, ByteUnit, TimeSpent};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{RawIO, SignalKind, SignalWatch};
@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 pub struct FuseSession<T> {
@@ -170,7 +170,7 @@ impl<T: FileSystem> FuseSession<T> {
         let watch_fds_cloned = watch_fds.to_owned();
         self.rt.spawn(async move {
             use libc::{poll, pollfd, POLLERR, POLLHUP};
-            use std::time::Duration;
+            use std::time::{Duration, Instant};
             let mut pfds: Vec<pollfd> = watch_fds_cloned
                 .iter()
                 .map(|fd| pollfd {
@@ -248,71 +248,99 @@ impl<T: FileSystem> FuseSession<T> {
     }
 
     async fn persist(&self, mnts: Vec<FuseMnt>) -> CommonResult<()> {
-        let mut writer = StateWriter::new(self.state_file())?;
-        let ts = TimeSpent::new();
-        info!("persist: task started, path={}", writer.path());
+        let metrics_start = Instant::now();
+        let result = async {
+            let mut writer = StateWriter::new(self.state_file())?;
+            let ts = TimeSpent::new();
+            info!("persist: task started, path={}", writer.path());
 
-        // Handle mount point file descriptors
-        // 1. Set auto_unmount to false to prevent automatic unmounting
-        // 2. Clear FD_CLOEXEC flag to allow child process inheritance
-        let mut fds = HashMap::new();
-        for mut mnt in mnts {
-            mnt.auto_unmount(false);
+            // Handle mount point file descriptors
+            // 1. Set auto_unmount to false to prevent automatic unmounting
+            // 2. Clear FD_CLOEXEC flag to allow child process inheritance
+            let mut fds = HashMap::new();
+            for mut mnt in mnts {
+                mnt.auto_unmount(false);
 
-            let flags = sys::fcntl_get(mnt.fd)?;
-            sys::fcntl_set(mnt.fd, flags & !libc::FD_CLOEXEC);
+                let flags = sys::fcntl_get(mnt.fd)?;
+                sys::fcntl_set(mnt.fd, flags & !libc::FD_CLOEXEC);
 
-            fds.insert(mnt.fd, mnt.path.to_string_lossy().to_string());
+                fds.insert(mnt.fd, mnt.path.to_string_lossy().to_string());
+            }
+
+            // Save file descriptors and state information to file
+            info!("persist: write mount fds {:?}", fds);
+            writer.write_struct(&fds)?;
+            self.fs.persist(&mut writer).await?;
+
+            info!(
+                "persist: task completed, path={}, size={}, elapsed={}ms",
+                writer.path(),
+                ByteUnit::byte_to_string(writer.len()),
+                ts.used_ms()
+            );
+
+            // Set environment variable to pass state file path and start child process
+            let mut env = HashMap::new();
+            env.insert(Self::STATE_PATH.to_owned(), writer.path().to_owned());
+            CommonUtils::reload_param(env)?;
+
+            Ok(())
         }
-
-        // Save file descriptors and state information to file
-        info!("persist: write mount fds {:?}", fds);
-        writer.write_struct(&fds)?;
-        self.fs.persist(&mut writer).await?;
-
-        info!(
-            "persist: task completed, path={}, size={}, elapsed={}ms",
-            writer.path(),
-            ByteUnit::byte_to_string(writer.len()),
-            ts.used_ms()
-        );
-
-        // Set environment variable to pass state file path and start child process
-        let mut env = HashMap::new();
-        env.insert(Self::STATE_PATH.to_owned(), writer.path().to_owned());
-        CommonUtils::reload_param(env)?;
-
-        Ok(())
+        .await;
+        let status = status_label(result.is_ok());
+        FuseMetrics::get()
+            .state_persist_total
+            .with_label_values(&[status])
+            .inc();
+        FuseMetrics::get()
+            .state_persist_duration_us
+            .with_label_values(&[status])
+            .observe(elapsed_us(metrics_start));
+        result
     }
 
     async fn restore(file: &str, conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
-        // If environment variable exists, restore state information from state file
-        let mut mnts = vec![];
-        let mut reader = StateReader::new(file)?;
-        let ts = TimeSpent::new();
-        info!("restore: task started, path={}", reader.path());
+        let metrics_start = Instant::now();
+        let result = async {
+            // If environment variable exists, restore state information from state file
+            let mut mnts = vec![];
+            let mut reader = StateReader::new(file)?;
+            let ts = TimeSpent::new();
+            info!("restore: task started, path={}", reader.path());
 
-        // Read and process mount point file descriptors
-        let fds: HashMap<RawIO, String> = reader.read_struct()?;
-        info!("restore: write mount fds {:?}", fds);
-        if fds.is_empty() {
-            return err_box!("no fd found in state file {}", reader.path());
+            // Read and process mount point file descriptors
+            let fds: HashMap<RawIO, String> = reader.read_struct()?;
+            info!("restore: write mount fds {:?}", fds);
+            if fds.is_empty() {
+                return err_box!("no fd found in state file {}", reader.path());
+            }
+            for (fd, path) in fds {
+                let flags = sys::fcntl_get(fd)?;
+                sys::fcntl_set(fd, flags | libc::FD_CLOEXEC)?;
+
+                let path_buf = PathBuf::from(path);
+                mnts.push(FuseMnt::from_fd(path_buf, conf, fd));
+            }
+
+            fs.restore(&mut reader).await?;
+
+            info!(
+                "restore: task completed, file_path={}, elapsed={}ms",
+                reader.path(),
+                ts.used_ms()
+            );
+            Ok(mnts)
         }
-        for (fd, path) in fds {
-            let flags = sys::fcntl_get(fd)?;
-            sys::fcntl_set(fd, flags | libc::FD_CLOEXEC)?;
-
-            let path_buf = PathBuf::from(path);
-            mnts.push(FuseMnt::from_fd(path_buf, conf, fd));
-        }
-
-        fs.restore(&mut reader).await?;
-
-        info!(
-            "restore: task completed, file_path={}, elapsed={}ms",
-            reader.path(),
-            ts.used_ms()
-        );
-        Ok(mnts)
+        .await;
+        let status = status_label(result.is_ok());
+        FuseMetrics::get()
+            .state_restore_total
+            .with_label_values(&[status])
+            .inc();
+        FuseMetrics::get()
+            .state_restore_duration_us
+            .with_label_values(&[status])
+            .observe(elapsed_us(metrics_start));
+        result
     }
 }

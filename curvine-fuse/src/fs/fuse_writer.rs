@@ -15,6 +15,7 @@
 use crate::fs::operator::Write;
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
+use crate::FuseMetrics;
 use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
@@ -22,11 +23,13 @@ use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
 use log::error;
+use orpc::common::{elapsed_us, status_label};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::{AtomicCounter, ErrorMonitor};
 use orpc::sys::DataSlice;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio_util::bytes::Bytes;
 
 enum WriteTask {
@@ -101,32 +104,73 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
+    fn path_type(path: &Path) -> &'static str {
+        if path.is_cv() {
+            "curvine"
+        } else {
+            "ufs"
+        }
+    }
+
     pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
         self.write_ver.incr();
-        self.sender
+        let enqueue_start = Instant::now();
+        let res = self
+            .sender
             .send(WriteTask::Write(op.arg.offset as i64, op.data, reply))
             .await
-            .map_err(|e| self.check_error(e.into()))
+            .map_err(|e| self.check_error(e.into()));
+        let status = status_label(res.is_ok());
+        FuseMetrics::get().observe_stream_enqueue("write", status, elapsed_us(enqueue_start));
+        if res.is_ok() {
+            FuseMetrics::get()
+                .stream_queue_depth
+                .with_label_values(&["write"])
+                .inc();
+        }
+        res
     }
 
     pub async fn flush(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let fun = async {
-            let (rx, tx) = CallChannel::channel();
-            self.sender.send(WriteTask::Flush(rx, reply)).await?;
-            tx.receive().await?;
-            Ok::<(), FsError>(())
-        };
-        fun.await.map_err(|e| self.check_error(e))
+        let (rx, tx) = CallChannel::channel();
+        let enqueue_start = Instant::now();
+        let send_res = self
+            .sender
+            .send(WriteTask::Flush(rx, reply))
+            .await
+            .map_err(|e| self.check_error(e.into()));
+        let status = status_label(send_res.is_ok());
+        FuseMetrics::get().observe_stream_enqueue("flush", status, elapsed_us(enqueue_start));
+        if send_res.is_ok() {
+            FuseMetrics::get()
+                .stream_queue_depth
+                .with_label_values(&["flush"])
+                .inc();
+        }
+        send_res?;
+        tx.receive().await.map_err(|e| self.check_error(e.into()))?;
+        Ok(())
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let fun = async {
-            let (rx, tx) = CallChannel::channel();
-            self.sender.send(WriteTask::Complete(rx, reply)).await?;
-            tx.receive().await?;
-            Ok::<(), FsError>(())
-        };
-        fun.await.map_err(|e| self.check_error(e))
+        let (rx, tx) = CallChannel::channel();
+        let enqueue_start = Instant::now();
+        let send_res = self
+            .sender
+            .send(WriteTask::Complete(rx, reply))
+            .await
+            .map_err(|e| self.check_error(e.into()));
+        let status = status_label(send_res.is_ok());
+        FuseMetrics::get().observe_stream_enqueue("release", status, elapsed_us(enqueue_start));
+        if send_res.is_ok() {
+            FuseMetrics::get()
+                .stream_queue_depth
+                .with_label_values(&["release"])
+                .inc();
+        }
+        send_res?;
+        tx.receive().await.map_err(|e| self.check_error(e.into()))?;
+        Ok(())
     }
 
     pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
@@ -154,10 +198,16 @@ impl FuseWriter {
         file_len: Arc<Mutex<i64>>,
     ) -> FsResult<()> {
         let mut complete = false;
+        let path_type = Self::path_type(writer.path());
         while let Some(task) = req_receiver.recv().await {
             match task {
                 WriteTask::Write(off, data, reply) => {
+                    FuseMetrics::get()
+                        .stream_queue_depth
+                        .with_label_values(&["write"])
+                        .dec();
                     let len = data.len();
+                    let start = Instant::now();
                     let res: FsResult<fuse_write_out> = writer
                         .fuse_write(off, DataSlice::Bytes(data))
                         .await
@@ -165,6 +215,18 @@ impl FuseWriter {
                             size: len as u32,
                             padding: 0,
                         });
+                    let status = status_label(res.is_ok());
+                    FuseMetrics::get().observe_io(
+                        "write",
+                        path_type,
+                        status,
+                        if res.is_ok() { len } else { 0 },
+                        elapsed_us(start),
+                        Some(len),
+                    );
+                    if res.is_err() {
+                        FuseMetrics::get().observe_io_error("write", path_type, "unknown");
+                    }
 
                     if res.is_ok() {
                         let mut lock = file_len.lock().unwrap();
@@ -175,7 +237,24 @@ impl FuseWriter {
                 }
 
                 WriteTask::Flush(tx, reply) => {
+                    FuseMetrics::get()
+                        .stream_queue_depth
+                        .with_label_values(&["flush"])
+                        .dec();
+                    let start = Instant::now();
                     let res = writer.flush().await;
+                    let status = status_label(res.is_ok());
+                    FuseMetrics::get().observe_io(
+                        "flush",
+                        path_type,
+                        status,
+                        0,
+                        elapsed_us(start),
+                        None,
+                    );
+                    if res.is_err() {
+                        FuseMetrics::get().observe_io_error("flush", path_type, "unknown");
+                    }
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
                     }
@@ -183,6 +262,11 @@ impl FuseWriter {
                 }
 
                 WriteTask::Complete(tx, reply) => {
+                    FuseMetrics::get()
+                        .stream_queue_depth
+                        .with_label_values(&["release"])
+                        .dec();
+                    let start = Instant::now();
                     let res = if !complete {
                         let res = writer.complete().await;
                         if res.is_ok() {
@@ -192,6 +276,18 @@ impl FuseWriter {
                     } else {
                         Ok(())
                     };
+                    let status = status_label(res.is_ok());
+                    FuseMetrics::get().observe_io(
+                        "release",
+                        path_type,
+                        status,
+                        0,
+                        elapsed_us(start),
+                        None,
+                    );
+                    if res.is_err() {
+                        FuseMetrics::get().observe_io_error("release", path_type, "unknown");
+                    }
 
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;

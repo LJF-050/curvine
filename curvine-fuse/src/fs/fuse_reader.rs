@@ -14,6 +14,7 @@
 
 use crate::fs::operator::Read;
 use crate::session::FuseResponse;
+use crate::FuseMetrics;
 use curvine_client::unified::UnifiedReader;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
@@ -21,10 +22,12 @@ use curvine_common::fs::{Path, Reader};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use log::error;
+use orpc::common::{elapsed_us, status_label};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::ErrorMonitor;
 use std::sync::Arc;
+use std::time::Instant;
 
 enum ReadTask {
     Read(i64, usize, FuseResponse),
@@ -89,7 +92,16 @@ impl FuseReader {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
+    fn path_type(path: &Path) -> &'static str {
+        if path.is_cv() {
+            "curvine"
+        } else {
+            "ufs"
+        }
+    }
+
     pub async fn read(&mut self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
+        let enqueue_start = Instant::now();
         let res = self
             .sender
             .send(ReadTask::Read(
@@ -99,32 +111,91 @@ impl FuseReader {
             ))
             .await
             .map_err(|e| self.check_error(e.into()));
+        let status = status_label(res.is_ok());
+        FuseMetrics::get().observe_stream_enqueue("read", status, elapsed_us(enqueue_start));
+        if res.is_ok() {
+            FuseMetrics::get()
+                .stream_queue_depth
+                .with_label_values(&["read"])
+                .inc();
+        }
         res
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let fun = async {
-            let (rx, tx) = CallChannel::channel();
-            self.sender.send(ReadTask::Complete(rx, reply)).await?;
-            tx.receive().await?;
-            Ok::<(), FsError>(())
-        };
-        fun.await.map_err(|e| self.check_error(e))
+        let (rx, tx) = CallChannel::channel();
+        let enqueue_start = Instant::now();
+        let send_res = self
+            .sender
+            .send(ReadTask::Complete(rx, reply))
+            .await
+            .map_err(|e| self.check_error(e.into()));
+        let status = status_label(send_res.is_ok());
+        FuseMetrics::get().observe_stream_enqueue("release", status, elapsed_us(enqueue_start));
+        if send_res.is_ok() {
+            FuseMetrics::get()
+                .stream_queue_depth
+                .with_label_values(&["release"])
+                .inc();
+        }
+        send_res?;
+        tx.receive().await.map_err(|e| self.check_error(e.into()))?;
+        Ok(())
     }
 
     async fn read_future(
         mut reader: UnifiedReader,
         mut req_receiver: AsyncReceiver<ReadTask>,
     ) -> FsResult<()> {
+        let path_type = Self::path_type(reader.path());
         while let Some(task) = req_receiver.recv().await {
             match task {
                 ReadTask::Read(off, len, reply) => {
+                    FuseMetrics::get()
+                        .stream_queue_depth
+                        .with_label_values(&["read"])
+                        .dec();
+                    let start = Instant::now();
                     let data = reader.fuse_read(off, len).await;
+                    let duration = elapsed_us(start);
+                    let status = status_label(data.is_ok());
+                    let bytes = data
+                        .as_ref()
+                        .map(|items| items.iter().map(|item| item.len()).sum::<usize>())
+                        .unwrap_or(0);
+                    FuseMetrics::get().observe_io(
+                        "read",
+                        path_type,
+                        status,
+                        bytes,
+                        duration,
+                        Some(len),
+                    );
+                    if data.is_err() {
+                        FuseMetrics::get().observe_io_error("read", path_type, "unknown");
+                    }
                     reply.send_data(data.map_err(|x| x.into())).await?;
                 }
 
                 ReadTask::Complete(tx, reply) => {
+                    FuseMetrics::get()
+                        .stream_queue_depth
+                        .with_label_values(&["release"])
+                        .dec();
+                    let start = Instant::now();
                     let res = reader.complete().await;
+                    let status = status_label(res.is_ok());
+                    FuseMetrics::get().observe_io(
+                        "release",
+                        path_type,
+                        status,
+                        0,
+                        elapsed_us(start),
+                        None,
+                    );
+                    if res.is_err() {
+                        FuseMetrics::get().observe_io_error("release", path_type, "unknown");
+                    }
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
                     }

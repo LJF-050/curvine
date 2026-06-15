@@ -507,4 +507,79 @@ mod tests {
             assert_contains(&output, needle);
         }
     }
+    #[test]
+    fn io_cache_and_state_metrics_are_exported_with_bounded_labels() {
+        FuseMetrics::ensure_init().unwrap();
+        let metrics = FuseMetrics::get();
+
+        metrics.observe_io("read", "curvine", "success", 4096, 33.0, Some(4096));
+        metrics.observe_io_error("write", "ufs", "IO");
+        metrics.observe_stream_enqueue("write", "success", 4.0);
+        metrics
+            .stream_queue_depth
+            .with_label_values(&["write"])
+            .inc();
+        metrics
+            .node_cache_hits_total
+            .with_label_values(&["node"])
+            .inc();
+        metrics
+            .node_cache_misses_total
+            .with_label_values(&["node", "not_found_or_expired"])
+            .inc();
+        metrics
+            .node_cache_invalidations_total
+            .with_label_values(&["explicit"])
+            .inc();
+        metrics
+            .readdir_entries_total
+            .with_label_values(&["success"])
+            .inc_by(3);
+        metrics
+            .readdir_duration_us
+            .with_label_values(&["success"])
+            .observe(44.0);
+        metrics
+            .state_persist_total
+            .with_label_values(&["success"])
+            .inc();
+        metrics
+            .state_persist_duration_us
+            .with_label_values(&["success"])
+            .observe(55.0);
+        metrics
+            .state_restore_total
+            .with_label_values(&["error"])
+            .inc();
+        metrics
+            .state_restore_duration_us
+            .with_label_values(&["error"])
+            .observe(66.0);
+
+        let output = Metrics::text_output().unwrap();
+        for needle in [
+            "curvine_fuse_io_bytes_total",
+            "curvine_fuse_io_requests_total",
+            "curvine_fuse_io_errors_total",
+            "curvine_fuse_io_duration_us_bucket",
+            "curvine_fuse_io_size_bytes_bucket",
+            "curvine_fuse_stream_queue_depth",
+            "curvine_fuse_stream_enqueue_duration_us_bucket",
+            "curvine_fuse_node_cache_hits_total",
+            "curvine_fuse_node_cache_misses_total",
+            "curvine_fuse_node_cache_invalidations_total",
+            "curvine_fuse_readdir_entries_total",
+            "curvine_fuse_readdir_duration_us_bucket",
+            "curvine_fuse_state_persist_total",
+            "curvine_fuse_state_persist_duration_us_bucket",
+            "curvine_fuse_state_restore_total",
+            "curvine_fuse_state_restore_duration_us_bucket",
+            "io_type=\"read\"",
+            "path_type=\"curvine\"",
+            "error_kind=\"IO\"",
+            "reason=\"not_found_or_expired\"",
+        ] {
+            assert_contains(&output, needle);
+        }
+    }
 }
