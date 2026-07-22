@@ -396,8 +396,9 @@ impl DirTree {
         inode.add_link(1);
 
         inode.update_status(status);
-        inode.parent = new_id;
-        inode.name = new_name.to_string();
+        // Hard links share one inode across multiple directory entries. Keep the
+        // original parent/name so get_path(oldnodeid) still resolves a valid
+        // source path for subsequent linkat calls (issue #1253).
 
         Ok(inode)
     }
@@ -851,6 +852,25 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, n_ref + 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, n_lookup + 1);
         assert_eq!(t.get_inode(400, Some("hard")).unwrap().ino, f);
+    }
+
+    /// Hard links must not rewrite the inode's canonical parent/name; get_path
+    /// needs a stable source path for subsequent linkat calls.
+    #[test]
+    fn hard_link_preserves_source_path() {
+        let mut t = DirTree::default();
+        t.lookup(FUSE_ROOT_ID, "olddir", dir_st("olddir", 500))
+            .unwrap();
+        t.lookup(FUSE_ROOT_ID, "newdir", dir_st("newdir", 501))
+            .unwrap();
+        let f = t.lookup(500, "oldfile", file_st("oldfile", 0)).unwrap().ino;
+        let before = t.get_path(f).unwrap().full_path().to_string();
+        t.link(f, 501, "newfile", file_st("newfile", f as i64))
+            .unwrap();
+        let after = t.get_path(f).unwrap().full_path().to_string();
+        assert_eq!(after, before);
+        assert!(after.contains("olddir"));
+        assert!(after.contains("oldfile"));
     }
 
     /// Hard link: `link` adds ref_ctr; each `unlink` of a dirent subtracts ref_ctr; inode removed when zero (after forget if n_lookup).

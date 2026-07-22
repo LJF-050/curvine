@@ -1,0 +1,34 @@
+{
+  "issue": "CurvineIO/curvine#1253",
+  "multica_issue": "CUR-86",
+  "fingerprint": "sha256:7a0782e10ee136e3d134cb24fc5659b1a58a5ac6bce0d5710f94f8c4955a5b02",
+  "head_sha": "abe42934895c49a3203d8a202c00241bc9d8402a",
+  "root_cause_hypothesis": "Hard-link dcache updates overwrite the canonical inode path so subsequent linkat calls resolve the wrong source path (ENOENT), and link/symlink FUSE handlers skip POSIX permission and sticky-directory checks that LTP expects when check_permission is enabled.",
+  "affected_modules": [
+    "curvine-fuse/src/fs/dcache/dir_tree.rs",
+    "curvine-fuse/src/fs/curvine_file_system.rs",
+    "curvine-fuse/src/fuse_utils.rs"
+  ],
+  "planned_changes": [
+    "Stop rewriting inode parent/name on hard link so get_path keeps a valid source path.",
+    "Add parent write/search and sticky hard-link permission checks before link RPC.",
+    "Add parent write/search permission checks before symlink RPC.",
+    "Add unit tests for dcache path stability and permission helpers."
+  ],
+  "not_goals": [
+    "Do not change master-side link/symlink persistence semantics.",
+    "Do not refactor unrelated rename or setattr paths.",
+    "Do not alter harness runner configuration."
+  ],
+  "verification_plan": [
+    "make format",
+    "cargo clippy -p curvine-fuse -- -D warnings",
+    "cargo test -p curvine-fuse",
+    "Harness LTP linkat01, prot_hsymlinks, link01 on curvine-fuse"
+  ],
+  "estimated_non_generated_source_line_delta": 120,
+  "risk": {
+    "level": "low",
+    "rationale": "Aligns FUSE link/symlink with POSIX permission semantics already enforced on other mutating ops; dcache path fix is localized to hard-link bookkeeping."
+  }
+}

@@ -367,10 +367,19 @@ impl CurvineFileSystem {
     }
 
     async fn check_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
+        self.check_inode_access(header.nodeid, header, mask).await
+    }
+
+    async fn check_inode_access(
+        &self,
+        ino: u64,
+        header: &fuse_in_header,
+        mask: u32,
+    ) -> FuseResult<()> {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
         }
-        let status = self.state.fs_stat(header.nodeid, None).await?;
+        let status = self.state.fs_stat(ino, None).await?;
         self.check_access_permissions(&status, header, mask)
     }
 
@@ -1236,24 +1245,48 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
         let oldnodeid = op.arg.oldnodeid;
+        let parent_ino = op.header.nodeid;
+        let access_mask = (libc::W_OK | libc::X_OK) as u32;
+
+        self.check_inode_access(parent_ino, op.header, access_mask)
+            .await?;
+
+        let src_status = self.state.fs_stat(oldnodeid, None).await?;
+        let dest_dir_status = self.state.fs_stat(parent_ino, None).await?;
+        let src_uid = self.resolve_file_uid(&src_status.owner);
+        let dest_dir_uid = self.resolve_file_uid(&dest_dir_status.owner);
+
+        if self.conf.check_permission && op.header.uid != 0 && op.header.uid != src_uid {
+            return err_fuse!(
+                libc::EPERM,
+                "link denied: caller uid {} does not own source inode {}",
+                op.header.uid,
+                oldnodeid
+            );
+        }
+
+        FuseUtils::check_sticky_hardlink(
+            self.conf.check_permission,
+            op.header.uid,
+            dest_dir_uid,
+            src_uid,
+            dest_dir_status.mode,
+        )?;
 
         self.state.fs_fsync(oldnodeid, None).await?;
 
-        let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        let des_path = self.state.get_path_common(parent_ino, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
         self.ensure_writable_path(&src_path, RpcCode::Link).await?;
         self.ensure_writable_path(&des_path, RpcCode::Link).await?;
 
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
-            src_path, des_path, oldnodeid, op.header.nodeid
+            src_path, des_path, oldnodeid, parent_ino
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        let attr = self
-            .state
-            .lookup_link(op.header.nodeid, name, oldnodeid)
-            .await?;
+        let attr = self.state.lookup_link(parent_ino, name, oldnodeid).await?;
 
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1311,6 +1344,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.ensure_writable_path(&link_path, RpcCode::Symlink)
+            .await?;
+        self.check_inode_access(id, op.header, (libc::W_OK | libc::X_OK) as u32)
             .await?;
         let owner = sys::get_username_by_uid(op.header.uid).unwrap_or(op.header.uid.to_string());
         let group = sys::get_groupname_by_gid(op.header.gid).unwrap_or(op.header.gid.to_string());

@@ -285,6 +285,31 @@ impl FuseUtils {
             .build()
     }
 
+    /// Sticky-directory hard-link rule: caller must own the source file or the
+    /// destination directory (Linux vfs_link / may_link semantics).
+    pub fn check_sticky_hardlink(
+        check_permission: bool,
+        caller_uid: u32,
+        dest_dir_uid: u32,
+        source_file_uid: u32,
+        dest_dir_mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 {
+            return Ok(());
+        }
+        if dest_dir_mode & libc::S_ISVTX as u32 == 0 {
+            return Ok(());
+        }
+        if caller_uid == dest_dir_uid || caller_uid == source_file_uid {
+            return Ok(());
+        }
+        err_fuse!(
+            libc::EPERM,
+            "sticky directory hard link denied for uid {}",
+            caller_uid
+        )
+    }
+
     pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
         // Handle system extended attributes FIRST, before any path resolution
         // This avoids unnecessary operations and provides fastest response
@@ -866,6 +891,17 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn check_sticky_hardlink_denies_cross_owner_link() {
+        let err = FuseUtils::check_sticky_hardlink(true, 1000, 0, 0, 0o1777).unwrap_err();
+        assert_eq!(err.errno, libc::EPERM);
+
+        assert!(FuseUtils::check_sticky_hardlink(true, 0, 0, 1000, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 1000, 0, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 0, 1000, 0o1777).is_ok());
+        assert!(FuseUtils::check_sticky_hardlink(true, 1000, 0, 0, 0o755).is_ok());
     }
 
     #[test]
