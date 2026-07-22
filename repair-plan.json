@@ -7,13 +7,14 @@
   "affected_modules": [
     "curvine-fuse/src/fs/dcache/dir_tree.rs",
     "curvine-fuse/src/fs/curvine_file_system.rs",
-    "curvine-fuse/src/fuse_utils.rs"
+    "curvine-fuse/src/fuse_utils.rs",
+    "curvine-server/src/master/meta/fs_dir.rs"
   ],
   "planned_changes": [
     "Stop rewriting inode parent/name on hard link so get_path keeps a valid source path.",
     "Add parent write/search and sticky hard-link permission checks before link RPC.",
     "Add parent write/search permission checks before symlink RPC.",
-    "Add unit tests for dcache path stability and permission helpers."
+    "Allow master hard links to symlink inodes for link01.",
   ],
   "not_goals": [
     "Do not change master-side link/symlink persistence semantics.",

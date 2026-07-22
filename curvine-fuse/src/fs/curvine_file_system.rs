@@ -1256,15 +1256,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let src_uid = self.resolve_file_uid(&src_status.owner);
         let dest_dir_uid = self.resolve_file_uid(&dest_dir_status.owner);
 
-        if self.conf.check_permission && op.header.uid != 0 && op.header.uid != src_uid {
-            return err_fuse!(
-                libc::EPERM,
-                "link denied: caller uid {} does not own source inode {}",
-                op.header.uid,
-                oldnodeid
-            );
-        }
-
         FuseUtils::check_sticky_hardlink(
             self.conf.check_permission,
             op.header.uid,
