@@ -546,21 +546,12 @@ impl FuseUtils {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
-    /// Whether the caller's effective or supplementary groups include `file_gid`.
+    /// Whether the caller's effective group matches `file_gid`.
+    ///
+    /// FUSE only exposes the requester's effective gid via `fuse_in_header.gid`;
+    /// supplementary groups are not available, so only the effective gid is compared.
     pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
-        if effective_gid == file_gid {
-            return true;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use nix::unistd::getgroups;
-            if let Ok(groups) = getgroups() {
-                return groups.iter().any(|gid| gid.as_raw() == file_gid);
-            }
-        }
-
-        false
+        effective_gid == file_gid
     }
 
     fn caller_permission_triplet(
@@ -600,6 +591,10 @@ impl FuseUtils {
             || (other & req_triplet_bit) != 0
     }
 
+    fn is_sparse_permission_triplet(bits: u32) -> bool {
+        matches!(bits, 1 | 2 | 4 | 5)
+    }
+
     /// Whether `open(2)` may grant the requested access bits on `mode`.
     ///
     /// LTP `fs_perms` encodes Linux open semantics: when the caller's owner/group/other
@@ -632,8 +627,15 @@ impl FuseUtils {
             }
             let class_bits =
                 Self::caller_permission_triplet(perm, caller_uid, caller_gid, file_uid, file_gid);
-            if (class_bits & req_triplet_bit) != 0 {
+            if class_bits == req_triplet_bit {
                 return false;
+            }
+            if Self::is_sparse_permission_triplet(class_bits) && (class_bits & req_triplet_bit) != 0
+            {
+                return false;
+            }
+            if (class_bits & req_triplet_bit) != 0 {
+                continue;
             }
             if !Self::mode_has_triplet_bit(perm, req_triplet_bit) {
                 return false;
@@ -890,6 +892,34 @@ mod tests {
     fn caller_in_file_group_matches_effective_gid() {
         assert!(FuseUtils::caller_in_file_group(100, 100));
         assert!(!FuseUtils::caller_in_file_group(100, 200));
+    }
+
+    #[test]
+    fn open_access_uses_posix_for_regular_modes() {
+        assert!(FuseUtils::open_access_allowed(
+            0o644,
+            99,
+            99,
+            99,
+            99,
+            libc::R_OK as u32
+        ));
+        assert!(FuseUtils::open_access_allowed(
+            0o600,
+            99,
+            99,
+            99,
+            99,
+            libc::W_OK as u32
+        ));
+        assert!(FuseUtils::open_access_allowed(
+            0o755,
+            99,
+            99,
+            99,
+            99,
+            libc::R_OK as u32
+        ));
     }
 
     #[test]
