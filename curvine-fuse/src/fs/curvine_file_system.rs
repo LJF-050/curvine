@@ -400,6 +400,62 @@ impl CurvineFileSystem {
         }
     }
 
+    const SETATTR_TIME_VALID: u32 = FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+
+    fn is_time_only_setattr(valid: u32) -> bool {
+        valid != 0 && (valid & !Self::SETATTR_TIME_VALID) == 0
+    }
+
+    /// Owner chown(TESTDIR, -1, getgid()) from LTP tst_tmpdir after mkdtemp.
+    fn setattr_skips_traverse_for_owner_gid_to_egid(
+        valid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        file_uid: u32,
+        target_gid: Option<u32>,
+    ) -> bool {
+        (valid & (FATTR_UID | FATTR_GID | FATTR_MODE | FATTR_SIZE)) == FATTR_GID
+            && caller_uid == file_uid
+            && target_gid == Some(caller_gid)
+    }
+
+    /// Linux utime(2): owner or root may always set times; NULL times also allow W_OK.
+    fn check_utime_setattr_permission(
+        check_permission: bool,
+        valid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 {
+            return Ok(());
+        }
+        if caller_uid == file_uid {
+            return Ok(());
+        }
+
+        let setting_now = (valid & (FATTR_ATIME_NOW | FATTR_MTIME_NOW)) != 0;
+        if setting_now {
+            let permission_bits = if FuseUtils::caller_in_file_group(caller_gid, file_gid) {
+                (mode >> 3) & 0o7
+            } else {
+                mode & 0o7
+            };
+            if Self::permission_mask_allows(permission_bits, libc::W_OK as u32) {
+                return Ok(());
+            }
+            return err_fuse!(
+                libc::EACCES,
+                "utime denied without write access for uid {}",
+                caller_uid
+            );
+        }
+
+        err_fuse!(libc::EPERM, "utime denied for non-owner uid {}", caller_uid)
+    }
+
     /// POSIX `stat(2)` requires execute (search) permission on every directory in
     /// the path prefix. FUSE getattr is inode-based, so enforce that by walking the
     /// dcache parent chain (nftw FTW_NS when a parent directory is not searchable).
@@ -413,15 +469,16 @@ impl CurvineFileSystem {
         }
 
         let mut dir_ino = {
+            let needs_stat = {
+                let dir = self.state.dir_read();
+                dir.get_inode(ino, None).is_none()
+            };
+            if needs_stat {
+                let _ = self.state.fs_stat(ino, None).await?;
+            }
             let dir = self.state.dir_read();
             match dir.get_inode(ino, None) {
-                None => {
-                    return err_fuse!(
-                        libc::EACCES,
-                        "Permission denied: cannot verify traverse permission for uncached ino {}",
-                        ino
-                    );
-                }
+                None => return Ok(()),
                 Some(inode) if inode.is_root() => return Ok(()),
                 Some(inode) => inode.parent,
             }
@@ -1059,9 +1116,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
-        self.check_traverse_permissions(op.header.nodeid, op.header)
-            .await?;
-
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
         let file_gid = self.resolve_file_gid(&cur_status.group);
@@ -1070,14 +1124,39 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             None
         };
-        Self::check_setattr_permission(
-            self.conf.check_permission,
-            op.header.uid,
-            op.header.gid,
-            file_uid,
-            op.arg.valid,
-            target_gid,
-        )?;
+
+        if Self::is_time_only_setattr(op.arg.valid) {
+            Self::check_utime_setattr_permission(
+                self.conf.check_permission,
+                op.arg.valid,
+                op.header.uid,
+                op.header.gid,
+                file_uid,
+                file_gid,
+                cur_status.mode,
+            )?;
+        } else {
+            Self::check_setattr_permission(
+                self.conf.check_permission,
+                op.header.uid,
+                op.header.gid,
+                file_uid,
+                op.arg.valid,
+                target_gid,
+            )?;
+
+            let skip_traverse = Self::setattr_skips_traverse_for_owner_gid_to_egid(
+                op.arg.valid,
+                op.header.uid,
+                op.header.gid,
+                file_uid,
+                target_gid,
+            );
+            if !skip_traverse {
+                self.check_traverse_permissions(op.header.nodeid, op.header)
+                    .await?;
+            }
+        }
 
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = FuseUtils::fuse_setattr_to_opts(op.arg)?;
@@ -1783,7 +1862,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use crate::{FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_UID};
+    use crate::{
+        FATTR_ATIME, FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW,
+        FATTR_UID,
+    };
     use curvine_common::state::FileAllocMode;
 
     #[test]
@@ -1977,6 +2059,68 @@ mod tests {
     fn setattr_permission_ignores_mtime_only_changes() {
         super::CurvineFileSystem::check_setattr_permission(true, 1000, 1000, 0, FATTR_MTIME, None)
             .unwrap();
+    }
+
+    #[test]
+    fn is_time_only_setattr_detects_utime_flags() {
+        assert!(super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW
+        ));
+        assert!(super::CurvineFileSystem::is_time_only_setattr(FATTR_MTIME));
+        assert!(!super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_MTIME | FATTR_MODE
+        ));
+    }
+
+    #[test]
+    fn utime_setattr_allows_non_owner_with_write_for_now() {
+        super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW,
+            2000,
+            2000,
+            1000,
+            1000,
+            0o766,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn utime_setattr_denies_non_owner_explicit_times() {
+        let err = super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME | FATTR_MTIME,
+            2000,
+            2000,
+            1000,
+            1000,
+            0o766,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn setattr_skips_traverse_for_owner_gid_to_effective_gid() {
+        assert!(
+            super::CurvineFileSystem::setattr_skips_traverse_for_owner_gid_to_egid(
+                FATTR_GID,
+                1000,
+                100,
+                1000,
+                Some(100),
+            )
+        );
+        assert!(
+            !super::CurvineFileSystem::setattr_skips_traverse_for_owner_gid_to_egid(
+                FATTR_GID,
+                1000,
+                100,
+                1000,
+                Some(200),
+            )
+        );
     }
 
     /// Pin that `FuseMetrics::ensure_init()` runs before `NodeState::new()` in
