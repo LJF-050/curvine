@@ -386,6 +386,32 @@ impl CurvineFileSystem {
         self.check_access_permissions(&status, header, mask)
     }
 
+    async fn check_open_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+        let status = self.state.fs_stat(header.nodeid, None).await?;
+        let file_uid = self.resolve_file_uid(&status.owner);
+        let file_gid = self.resolve_file_gid(&status.group);
+        if FuseUtils::open_access_allowed(
+            status.mode,
+            header.uid,
+            header.gid,
+            file_uid,
+            file_gid,
+            mask,
+        ) {
+            Ok(())
+        } else {
+            err_fuse!(
+                libc::EACCES,
+                "Permission denied to open ino: {}, op: {}",
+                header.nodeid,
+                header.opcode
+            )
+        }
+    }
+
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
     /// execute bit in the file mode, not the caller's owner/group/other class.
     fn check_root_access_permissions(status: &FileStatus) -> FuseResult<()> {
@@ -1161,7 +1187,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check directory permissions based on open action
         let dir_path = self.state.get_path(op.header.nodeid)?;
-        self.check_permissions(op.header, action.acl_mask()).await?;
+        self.check_open_permissions(op.header, action.acl_mask())
+            .await?;
 
         let handle = self
             .state
@@ -1281,7 +1308,8 @@ impl fs::FileSystem for CurvineFileSystem {
             if action.write() || truncate {
                 return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
             }
-            self.check_permissions(op.header, action.acl_mask()).await?;
+            self.check_open_permissions(op.header, action.acl_mask())
+                .await?;
             let ino = op.header.nodeid;
             let handle = self.state.new_meta_handle(ino, status).await?;
             let open_flags = FuseUtils::file_open_flags(&self.conf, false);
@@ -1296,7 +1324,8 @@ impl fs::FileSystem for CurvineFileSystem {
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
         }
-        self.check_permissions(op.header, action.acl_mask()).await?;
+        self.check_open_permissions(op.header, action.acl_mask())
+            .await?;
 
         let ino = op.header.nodeid;
         let opts = FuseUtils::open_opts(&self.fs);

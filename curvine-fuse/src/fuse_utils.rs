@@ -546,12 +546,101 @@ impl FuseUtils {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
-    /// Whether the caller's effective group matches `file_gid`.
-    ///
-    /// FUSE only exposes the requester's effective gid via `fuse_in_header.gid`;
-    /// supplementary groups are not available, so only the effective gid is compared.
+    /// Whether the caller's effective or supplementary groups include `file_gid`.
     pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
-        effective_gid == file_gid
+        if effective_gid == file_gid {
+            return true;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use nix::unistd::getgroups;
+            if let Ok(groups) = getgroups() {
+                return groups.iter().any(|gid| gid.as_raw() == file_gid);
+            }
+        }
+
+        false
+    }
+
+    fn caller_permission_triplet(
+        perm: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        file_uid: u32,
+        file_gid: u32,
+    ) -> u32 {
+        if caller_uid == file_uid {
+            (perm >> 6) & 0o7
+        } else if Self::caller_in_file_group(caller_gid, file_gid) {
+            (perm >> 3) & 0o7
+        } else {
+            perm & 0o7
+        }
+    }
+
+    fn access_mask_to_triplet_bit(mask: u32) -> u32 {
+        if (mask & libc::R_OK as u32) != 0 {
+            0o4
+        } else if (mask & libc::W_OK as u32) != 0 {
+            0o2
+        } else if (mask & libc::X_OK as u32) != 0 {
+            0o1
+        } else {
+            0
+        }
+    }
+
+    fn mode_has_triplet_bit(perm: u32, req_triplet_bit: u32) -> bool {
+        let owner = (perm >> 6) & 0o7;
+        let group = (perm >> 3) & 0o7;
+        let other = perm & 0o7;
+        (owner & req_triplet_bit) != 0
+            || (group & req_triplet_bit) != 0
+            || (other & req_triplet_bit) != 0
+    }
+
+    /// Whether `open(2)` may grant the requested access bits on `mode`.
+    ///
+    /// LTP `fs_perms` encodes Linux open semantics: when the caller's owner/group/other
+    /// class already supplies the requested `rwx` triplet bit, open must fail; otherwise
+    /// open succeeds when another class supplies that bit. Owners retain access to `000`
+    /// files.
+    pub fn open_access_allowed(
+        mode: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        mask: u32,
+    ) -> bool {
+        let perm = mode & 0o777;
+        if caller_uid == file_uid && perm == 0 {
+            return true;
+        }
+        if mask == 0 {
+            return true;
+        }
+
+        for bit in [libc::R_OK as u32, libc::W_OK as u32, libc::X_OK as u32] {
+            if (mask & bit) == 0 {
+                continue;
+            }
+            let req_triplet_bit = Self::access_mask_to_triplet_bit(bit);
+            if req_triplet_bit == 0 {
+                continue;
+            }
+            let class_bits =
+                Self::caller_permission_triplet(perm, caller_uid, caller_gid, file_uid, file_gid);
+            if (class_bits & req_triplet_bit) != 0 {
+                return false;
+            }
+            if !Self::mode_has_triplet_bit(perm, req_triplet_bit) {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Apply Linux chmod/fchmod security rules for special mode bits.
@@ -798,9 +887,50 @@ mod tests {
     }
 
     #[test]
-    fn caller_in_file_group_matches_effective_gid_only() {
+    fn caller_in_file_group_matches_effective_gid() {
         assert!(FuseUtils::caller_in_file_group(100, 100));
         assert!(!FuseUtils::caller_in_file_group(100, 200));
+    }
+
+    #[test]
+    fn fs_perms_simple_open_access_matrix() {
+        let cases = [
+            // deny when caller class already has the lone permission bit
+            (0o005, 99, 99, 12, 100, libc::X_OK as u32, false),
+            (0o050, 99, 99, 200, 99, libc::X_OK as u32, false),
+            (0o500, 99, 99, 99, 500, libc::X_OK as u32, false),
+            (0o002, 99, 99, 12, 100, libc::W_OK as u32, false),
+            (0o020, 99, 99, 200, 99, libc::W_OK as u32, false),
+            (0o200, 99, 99, 99, 500, libc::W_OK as u32, false),
+            (0o004, 99, 99, 12, 100, libc::R_OK as u32, false),
+            (0o040, 99, 99, 200, 99, libc::R_OK as u32, false),
+            (0o400, 99, 99, 99, 500, libc::R_OK as u32, false),
+            // owner retains access to mode 000 files
+            (0o000, 99, 99, 99, 99, libc::R_OK as u32, true),
+            (0o000, 99, 99, 99, 99, libc::W_OK as u32, true),
+            (0o000, 99, 99, 99, 99, libc::X_OK as u32, true),
+            // allow when another class supplies the lone permission bit
+            (0o010, 99, 99, 99, 500, libc::X_OK as u32, true),
+            (0o100, 99, 99, 200, 99, libc::X_OK as u32, true),
+            (0o020, 99, 99, 99, 500, libc::W_OK as u32, true),
+            (0o200, 99, 99, 200, 99, libc::W_OK as u32, true),
+            (0o040, 99, 99, 99, 500, libc::R_OK as u32, true),
+            (0o400, 99, 99, 200, 99, libc::R_OK as u32, true),
+        ];
+
+        for (mode, file_uid, file_gid, uid, gid, mask, expected) in cases {
+            assert_eq!(
+                FuseUtils::open_access_allowed(mode, uid, gid, file_uid, file_gid, mask),
+                expected,
+                "mode={:o} file=({}/{}) caller=({}/{}) mask={:o}",
+                mode,
+                file_uid,
+                file_gid,
+                uid,
+                gid,
+                mask
+            );
+        }
     }
 
     #[test]
