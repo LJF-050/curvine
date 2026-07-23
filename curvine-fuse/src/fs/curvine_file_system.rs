@@ -390,26 +390,36 @@ impl CurvineFileSystem {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
         }
-        let status = self.state.fs_stat(header.nodeid, None).await?;
-        let file_uid = self.resolve_file_uid(&status.owner);
-        let file_gid = self.resolve_file_gid(&status.group);
-        if FuseUtils::open_access_allowed(
-            status.mode,
-            header.uid,
-            header.gid,
-            file_uid,
-            file_gid,
-            mask,
-        ) {
-            Ok(())
-        } else {
-            err_fuse!(
-                libc::EACCES,
-                "Permission denied to open ino: {}, op: {}",
-                header.nodeid,
-                header.opcode
-            )
+
+        let write_mask = mask & libc::W_OK as u32;
+        let other_mask = mask & !(libc::W_OK as u32);
+
+        if write_mask != 0 {
+            let status = self.state.fs_stat(header.nodeid, None).await?;
+            let file_uid = self.resolve_file_uid(&status.owner);
+            let file_gid = self.resolve_file_gid(&status.group);
+            if !FuseUtils::open_access_allowed(
+                status.mode,
+                header.uid,
+                header.gid,
+                file_uid,
+                file_gid,
+                write_mask,
+            ) {
+                return err_fuse!(
+                    libc::EACCES,
+                    "Permission denied to open ino: {}, op: {}",
+                    header.nodeid,
+                    header.opcode
+                );
+            }
         }
+
+        if other_mask != 0 {
+            self.check_permissions(header, other_mask).await?;
+        }
+
+        Ok(())
     }
 
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
