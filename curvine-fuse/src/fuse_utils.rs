@@ -583,12 +583,12 @@ impl FuseUtils {
         )
     }
 
-    pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
+    pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr, generation: u64) -> fuse_entry_out {
         let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
             Self::kernel_cache_timeouts(conf);
         fuse_entry_out {
             nodeid: attr.ino,
-            generation: 0,
+            generation,
             entry_valid,
             attr_valid,
             entry_valid_nsec,

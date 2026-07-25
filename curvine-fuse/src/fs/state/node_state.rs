@@ -42,7 +42,6 @@ use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHas
 use curvine_sys::RawPtr;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
-use std::borrow::Cow;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct NodeState {
@@ -179,7 +178,7 @@ impl NodeState {
     }
 
     pub fn next_ino(&self, status: &FileStatus) -> FuseResult<u64> {
-        self.dir_read().next_id(status.id)
+        self.dir_write().next_id(status.id)
     }
 
     pub async fn lock_path(&self, path: &Path) -> tokio::sync::MutexGuard<'_, ()> {
@@ -856,23 +855,92 @@ impl NodeState {
         Ok(status)
     }
 
-    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through the root, because
-        // root's `parent` is the `0` sentinel and inode 0 does not exist.
-        let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
+    pub fn inode_generation(&self, ino: u64) -> u64 {
+        self.dir_read().inode_generation(ino)
+    }
+
+    async fn root_attr(&self) -> FuseResult<fuse_attr> {
+        let dir = self.dir_read();
+        let root = dir.get_inode_check(FUSE_ROOT_ID, None)?;
+        FuseUtils::status_to_attr(&self.conf, &root.status)
+    }
+
+    fn resolve_export_lookup(&self, ino: u64, name: &str) -> FuseResult<(u64, String)> {
+        if ino == FUSE_ROOT_ID && (name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR) {
+            return err_fuse!(libc::EIO, "root export lookup must be handled by caller");
+        }
+
+        let dir = self.dir_read();
+        let (parent, lookup_name) = if name == FUSE_CURRENT_DIR {
+            match dir.get_inode(ino, None) {
+                Some(inode) => (inode.parent, inode.name.clone()),
+                None => {
+                    let Some((parent, child_name)) = dir.export_dentry(ino) else {
+                        return err_fuse!(libc::ESTALE, "stale file handle for inode {}", ino);
+                    };
+                    (parent, child_name)
+                }
+            }
         } else if name == FUSE_PARENT_DIR {
-            let dir = self.dir_read();
-            let parent_inode = dir.get_inode_check(ino, None)?;
-            let inode = dir.get_inode_check(parent_inode.parent, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
+            let parent_ino = match dir.get_inode(ino, None) {
+                Some(child) => child.parent,
+                None => {
+                    let Some((parent, _)) = dir.export_dentry(ino) else {
+                        return err_fuse!(libc::ESTALE, "stale file handle for inode {}", ino);
+                    };
+                    parent
+                }
+            };
+            if parent_ino == FUSE_ROOT_ID || parent_ino == 0 {
+                return err_fuse!(libc::EIO, "parent export lookup resolved to root");
+            }
+            match dir.get_inode(parent_ino, None) {
+                Some(parent) => {
+                    if parent.is_root() {
+                        return err_fuse!(libc::EIO, "parent export lookup resolved to root");
+                    }
+                    let lookup_parent = if parent.parent == FUSE_ROOT_ID || parent.parent == 0 {
+                        FUSE_ROOT_ID
+                    } else {
+                        parent.parent
+                    };
+                    (lookup_parent, parent.name.clone())
+                }
+                None => {
+                    let Some((grandparent, parent_name)) = dir.export_dentry(parent_ino) else {
+                        return err_fuse!(libc::ESTALE, "stale file handle for inode {}", ino);
+                    };
+                    let lookup_parent = if grandparent == FUSE_ROOT_ID || grandparent == 0 {
+                        FUSE_ROOT_ID
+                    } else {
+                        grandparent
+                    };
+                    (lookup_parent, parent_name)
+                }
+            }
         } else {
-            (ino, Cow::Borrowed(name))
+            (ino, name.to_owned())
         };
 
-        let name = cow_name.as_ref();
+        Ok((parent, lookup_name))
+    }
+
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        if ino == FUSE_ROOT_ID && (name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR) {
+            return self.root_attr().await;
+        }
+
+        let (ino, lookup_name) = if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
+            match self.resolve_export_lookup(ino, name) {
+                Ok(target) => target,
+                Err(e) if e.errno == libc::EIO => return self.root_attr().await,
+                Err(e) => return Err(e),
+            }
+        } else {
+            (ino, name.to_owned())
+        };
+
+        let name = lookup_name.as_str();
 
         if let Some(status) = self.get_cached_status(ino, Some(name), true)? {
             if self.conf.metrics_enabled {

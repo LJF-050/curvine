@@ -81,6 +81,11 @@ impl CurvineFileSystem {
         &self.conf
     }
 
+    fn create_entry_out(&self, attr: fuse_attr) -> fuse_entry_out {
+        let generation = self.state.inode_generation(attr.ino);
+        FuseUtils::create_entry_out(&self.conf, attr, generation)
+    }
+
     fn setattr_size_needs_resize(
         target_len: u64,
         status_len: i64,
@@ -433,7 +438,8 @@ impl CurvineFileSystem {
                     FuseUtils::status_to_attr(&self.conf, status)?
                 };
 
-                let entry = FuseUtils::create_entry_out(&self.conf, attr);
+                let generation = dir.inode_generation(attr.ino);
+                let entry = FuseUtils::create_entry_out(&self.conf, attr, generation);
                 // dirent `off` is the resume cookie = position of the NEXT entry.
                 // See `readdir_next_cookie` (the infinite-loop guard).
                 let next_off = Self::readdir_next_cookie(index);
@@ -1097,7 +1103,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let entry = match res {
             Ok(mut attr) => {
                 self.state.update_writer_len(&mut attr).await;
-                FuseUtils::create_entry_out(&self.conf, attr)
+                self.create_entry_out(attr)
             }
 
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
@@ -1511,7 +1517,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let opts = FuseUtils::mkdir_opts(&op, &self.fs);
         let attr = self.state.fs_mkdir(ino, name, opts).await?;
         self.state.invalid_cache(ino, None, INVAL_REASON_MKDIR);
-        Ok(FuseUtils::create_entry_out(&self.conf, attr))
+        Ok(self.create_entry_out(attr))
     }
 
     async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
@@ -1646,18 +1652,9 @@ impl fs::FileSystem for CurvineFileSystem {
             );
         }
 
-        let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
-            FuseUtils::kernel_cache_timeouts(&self.conf);
+        let entry = self.create_entry_out(attr);
         let r = fuse_create_out(
-            fuse_entry_out {
-                nodeid: handle.ino(),
-                generation: 0,
-                entry_valid,
-                attr_valid,
-                entry_valid_nsec,
-                attr_valid_nsec,
-                attr,
-            },
+            entry,
             fuse_open_out {
                 fh: handle.fh(),
                 open_flags: FuseUtils::file_open_flags(&self.conf, true),
@@ -1855,7 +1852,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // covers LTP link01 dangling-symlink targets.
         let attr = self.state.lookup_link(parent_ino, name, oldnodeid).await?;
 
-        let result = FuseUtils::create_entry_out(&self.conf, attr);
+        let result = self.create_entry_out(attr);
         Ok(result)
     }
 
@@ -1935,7 +1932,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
 
         let attr = self.state.lookup_common(id, linkname).await?;
-        Ok(FuseUtils::create_entry_out(&self.conf, attr))
+        Ok(self.create_entry_out(attr))
     }
 
     // Read the target of a symbolic link
@@ -2062,7 +2059,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
-            Ok(FuseUtils::create_entry_out(&self.conf, attr))
+            Ok(self.create_entry_out(attr))
         } else {
             err_fuse!(libc::EPERM)
         }
@@ -2834,13 +2831,10 @@ mod tests {
         }
     }
 
+    // FUSE_EXPORT_SUPPORT is advertised once root `.`/`..` export reconstruction works.
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC
-            | FUSE_POSIX_ACL
-            | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | FUSE_INIT_EXT;
+        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
         let conf = init_conf(false, false);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
@@ -2850,13 +2844,12 @@ mod tests {
         );
     }
 
-    // EXPORT_SUPPORT stays out: Curvine cannot serve kernel `.`/`..` handle reconstruction.
     #[test]
-    fn export_support_not_in_allowlist() {
-        assert_eq!(
+    fn export_support_in_allowlist() {
+        assert_ne!(
             SUPPORTED_INIT_FLAGS & FUSE_EXPORT_SUPPORT,
             0,
-            "FUSE_EXPORT_SUPPORT must not be advertised until root `.`/`..` lookup works"
+            "FUSE_EXPORT_SUPPORT must be advertised for exportfs handle round-trips"
         );
     }
 

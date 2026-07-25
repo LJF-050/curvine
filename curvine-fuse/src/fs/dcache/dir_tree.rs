@@ -28,11 +28,23 @@ use curvine_runtime::sync::AtomicCounter;
 use log::info;
 use std::collections::hash_map::Iter;
 
+/// Stable parent/name identity for FUSE exportfs handle reconstruction after
+/// kernel FORGET evicts the inode from the dentry cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExportDentry {
+    parent: u64,
+    name: String,
+}
+
 pub struct DirTree {
     inodes: FastHashMap<u64, Inode>,
     id_creator: AtomicCounter,
     conf: FuseConf,
     cache_ttl: u64,
+    /// Survives inode eviction on FORGET so `LOOKUP(nodeid, ".")` can rehydrate.
+    export_dentries: FastHashMap<u64, ExportDentry>,
+    /// Per-nodeid generation for exportfs stale-handle detection.
+    node_generations: FastHashMap<u64, u64>,
 }
 
 impl DirTree {
@@ -43,9 +55,51 @@ impl DirTree {
             id_creator: AtomicCounter::new((i64::MAX / 2) as u64),
             conf,
             cache_ttl,
+            export_dentries: FastHashMap::default(),
+            node_generations: FastHashMap::default(),
         };
         tree.inodes.insert(FUSE_ROOT_ID, Inode::new_root());
+        tree.node_generations.insert(FUSE_ROOT_ID, 0);
         tree
+    }
+
+    pub fn inode_generation(&self, ino: u64) -> u64 {
+        self.node_generations.get(&ino).copied().unwrap_or(0)
+    }
+
+    pub fn export_dentry(&self, ino: u64) -> Option<(u64, String)> {
+        self.export_dentries
+            .get(&ino)
+            .map(|d| (d.parent, d.name.clone()))
+    }
+
+    fn record_export_dentry(&mut self, ino: u64, parent: u64, name: &str) {
+        if ino == FUSE_ROOT_ID {
+            return;
+        }
+        self.export_dentries.insert(
+            ino,
+            ExportDentry {
+                parent,
+                name: name.to_owned(),
+            },
+        );
+        self.node_generations.entry(ino).or_insert(0);
+    }
+
+    fn remove_export_dentry(&mut self, ino: u64) {
+        self.export_dentries.remove(&ino);
+        self.node_generations.remove(&ino);
+    }
+
+    fn bump_generation_on_reuse(&mut self, ino: u64) {
+        if self.export_dentries.contains_key(&ino) || self.node_generations.contains_key(&ino) {
+            let gen = self.node_generations.entry(ino).or_insert(0);
+            *gen += 1;
+            self.export_dentries.remove(&ino);
+        } else {
+            self.node_generations.insert(ino, 0);
+        }
     }
 
     pub fn inode_lens(&self) -> usize {
@@ -167,10 +221,11 @@ impl DirTree {
         Ok(())
     }
 
-    pub fn next_id(&self, cv_id: i64) -> FuseResult<u64> {
+    pub fn next_id(&mut self, cv_id: i64) -> FuseResult<u64> {
         Self::validate_backend_id(cv_id)?;
         let cv_id = cv_id as u64;
         if cv_id > FUSE_ROOT_ID && cv_id != FUSE_UNKNOWN_INO && !self.inodes.contains_key(&cv_id) {
+            self.node_generations.entry(cv_id).or_insert(0);
             return Ok(cv_id);
         }
 
@@ -178,9 +233,9 @@ impl DirTree {
             let id = self.id_creator.next();
             if id == FUSE_ROOT_ID || id == FUSE_UNKNOWN_INO || self.inodes.contains_key(&id) {
                 continue;
-            } else {
-                return Ok(id);
             }
+            self.bump_generation_on_reuse(id);
+            return Ok(id);
         }
     }
 
@@ -268,6 +323,7 @@ impl DirTree {
         let dir = self.get_dir_mut_check(parent)?;
         dir.add_child(name.to_owned(), ino);
 
+        self.record_export_dentry(ino, parent, name);
         self.get_inode_mut_check(ino, None)
     }
 
@@ -296,6 +352,7 @@ impl DirTree {
 
         if should_remove && !mark_delete {
             self.remove_inode(ino);
+            self.remove_export_dentry(ino);
         }
 
         Ok(())
@@ -435,6 +492,7 @@ impl DirTree {
         let inode = self.get_inode_mut_check(old_ino, None)?;
         inode.parent = new_id;
         inode.name = new_name.to_string();
+        self.record_export_dentry(old_ino, new_id, new_name);
 
         Ok(())
     }
@@ -457,7 +515,8 @@ impl DirTree {
         inode.update_status(status);
         inode.name = new_name.to_string();
 
-        Ok(inode)
+        self.record_export_dentry(old_id, new_id, new_name);
+        self.get_inode_check(old_id, None)
     }
 
     pub fn try_get_path(&self, parent: u64, name: Option<&str>) -> FuseResult<Path> {
@@ -1290,7 +1349,7 @@ mod test {
     #[test]
     fn next_id_diverges_when_backend_id_unassigned() {
         use crate::FUSE_UNKNOWN_INO;
-        let t = DirTree::default();
+        let mut t = DirTree::default();
 
         // id == 0 (<= FUSE_ROOT_ID): both calls allocate, and must differ.
         let a = t.next_id(0).unwrap();
