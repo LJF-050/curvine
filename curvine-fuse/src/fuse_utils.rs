@@ -541,10 +541,10 @@ impl FuseUtils {
             .build()
     }
 
-    pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
+    pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr, generation: u64) -> fuse_entry_out {
         fuse_entry_out {
             nodeid: attr.ino,
-            generation: 0,
+            generation,
             entry_valid: conf.entry_ttl.as_secs(),
             attr_valid: conf.attr_ttl.as_secs(),
             entry_valid_nsec: conf.entry_ttl.subsec_nanos(),
