@@ -2138,6 +2138,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
+        // Linux reports OFD locks with lk.pid == 0 and does not perform
+        // deadlock detection for F_OFD_SETLKW; keep them out of the POSIX wait graph.
+        let detect_deadlock = op.arg.lk.pid != 0;
         let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let is_unlock = lock.lock_type == LockType::UnLock;
         let full_range_unlock = Self::is_full_range_unlock(&lock);
@@ -2172,8 +2175,12 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             let blocker = conflict.as_ref().expect("conflict lock");
-            let decision = wait_guard
-                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id));
+            let decision = detect_deadlock.then(|| {
+                wait_guard.register_blocked_by(LockOwner::new(
+                    blocker.client_id.clone(),
+                    blocker.owner_id,
+                ))
+            });
             debug!(
                 "plock SETLKW wait decision unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
                 op.header.unique,
@@ -2189,7 +2196,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 blocker.end,
                 decision
             );
-            if decision.is_deadlock() {
+            if decision
+                .as_ref()
+                .is_some_and(PlockWaitDecision::is_deadlock)
+            {
                 // Cycle in the local wait graph. Re-sample Master once while
                 // keeping our edge published so a peer in a true multi-resource
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
