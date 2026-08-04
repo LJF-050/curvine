@@ -665,6 +665,22 @@ impl NodeState {
             (self.has_open_handles(ino), last_link)
         };
 
+        // Removing one of several hard links must reach the master immediately:
+        // the master owns the authoritative nlink count and removes only this
+        // directory entry. Open handles do not require deferral while another
+        // link still keeps the inode alive.
+        if !last_link {
+            match self.fs.delete(&path, false).await {
+                Ok(()) | Err(FsError::FileNotFound(_)) => (),
+                Err(e) => {
+                    self.clear_unlink_state(ino, parent, name)?;
+                    return Err(e.into());
+                }
+            }
+            self.clear_unlink_state(ino, parent, name)?;
+            return Ok(());
+        }
+
         if has_handles {
             debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
             return Ok(());
@@ -676,12 +692,6 @@ impl NodeState {
                 "unlink ino={}, path={}: handle appeared, deferring",
                 ino, path
             );
-            return Ok(());
-        }
-
-        // Only delete on the backend when the last hard link is removed.
-        if !last_link {
-            self.clear_unlink_state(ino, parent, name)?;
             return Ok(());
         }
 
