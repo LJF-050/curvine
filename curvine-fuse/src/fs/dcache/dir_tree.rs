@@ -261,9 +261,9 @@ impl DirTree {
         self.get_inode_mut_check(ino, None)
     }
 
-    pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
+    pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<bool> {
         let ino = self.get_ino_check(parent, Some(name))?;
-        let should_remove = {
+        let (last_link, should_remove) = {
             let inode = self.get_inode_mut_check(ino, None)?;
             // Only mark the whole inode deleted when removing its last link.
             // Otherwise remaining hardlink names would see is_deleted() and
@@ -274,7 +274,7 @@ impl DirTree {
             }
             inode.sub_ref(1);
             inode.sub_link(1);
-            inode.should_unref()
+            (last_link, inode.should_unref())
         };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
@@ -288,7 +288,7 @@ impl DirTree {
             self.remove_inode(ino);
         }
 
-        Ok(())
+        Ok(last_link)
     }
 
     pub fn forget(&mut self, ino: u64, n_lookup: u64) -> FuseResult<()> {
