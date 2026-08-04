@@ -284,6 +284,23 @@ impl DirTree {
             dir.mark_deleted_child(name);
         }
 
+        // get_path(ino) is used for subsequent opens. If the canonical dentry
+        // was removed, repoint it at one of the surviving hard-link names.
+        if !last_link {
+            let replacement = self.inodes.iter().find_map(|(parent_ino, parent_inode)| {
+                parent_inode.dir.as_ref().and_then(|entry| {
+                    entry.children.iter().find_map(|(child_name, child_ino)| {
+                        (*child_ino == ino).then(|| (*parent_ino, child_name.clone()))
+                    })
+                })
+            });
+            if let Some((new_parent, new_name)) = replacement {
+                let inode = self.get_inode_mut_check(ino, None)?;
+                inode.parent = new_parent;
+                inode.name = new_name;
+            }
+        }
+
         if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
@@ -999,12 +1016,19 @@ mod test {
             .unwrap()
             .ino;
         let before = t.get_path(f).unwrap().full_path().to_string();
-        t.link(f, 501, "newfile", file_st("newfile", f as i64))
-            .unwrap();
+        let mut link_status = file_st("newfile", f as i64);
+        link_status.nlink = 2;
+        t.link(f, 501, "newfile", link_status).unwrap();
         let after = t.get_path(f).unwrap().full_path().to_string();
         assert_eq!(after, before);
         assert!(after.contains("olddir"));
         assert!(after.contains("oldfile"));
+
+        t.unlink(500, "oldfile", true).unwrap();
+        let surviving_path = t.get_path(f).unwrap().full_path().to_string();
+        assert!(surviving_path.contains("newdir"), "{surviving_path}");
+        assert!(surviving_path.contains("newfile"));
+        assert!(!surviving_path.contains("oldfile"));
     }
 
     /// Hard link: `link` adds ref_ctr; each `unlink` of a dirent subtracts ref_ctr; inode removed when zero (after forget if n_lookup).
