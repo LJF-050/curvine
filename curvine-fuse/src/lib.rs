@@ -149,7 +149,7 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_POSIX_LOCKS
     | FUSE_FLOCK_LOCKS
     | FUSE_MAX_PAGES
-    | FUSE_MAX_PAGES;
+    | FUSE_EXPORT_SUPPORT;
 
 /// Human-readable FUSE init-capability names; unknown bits are kept as hex.
 pub fn fuse_init_flag_names(flags: u32) -> Vec<String> {
