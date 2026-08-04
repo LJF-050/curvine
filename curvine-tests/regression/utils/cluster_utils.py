@@ -105,7 +105,7 @@ def prepare_curvine_cluster(project_path, test_path='/curvine-fuse'):
             
             # Wait a bit for cluster to be fully ready
             print("Waiting for cluster to be ready...")
-            time.sleep(3)
+            time.sleep(30)
             
             return True, ""
         finally:
