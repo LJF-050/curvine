@@ -2832,17 +2832,9 @@ mod tests {
     // or any other unsupported capability, even when the kernel offers it. The
     // allowlist mask drops them.
     //
-    // FUSE_EXPORT_SUPPORT is included here (dropped even when offered): its `.`/`..`
-    // reconstruction relies on root `.`/`..` lookups that currently return ENOENT,
-    // so the daemon must not advertise it. Not advertising it leaves the kernel's
-    // `fc->export_support` unset, so the kernel never issues the root `.`/`..` LOOKUP.
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC
-            | FUSE_POSIX_ACL
-            | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | (1u32 << 30);
+        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | (1u32 << 30);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
         assert_eq!(
             out, 0,
@@ -2850,13 +2842,14 @@ mod tests {
         );
     }
 
-    // EXPORT_SUPPORT stays out: Curvine cannot serve kernel `.`/`..` handle reconstruction.
+    // Root `.`/`..` lookup reconstruction is supported, so kernel file handles
+    // remain valid across dcache eviction.
     #[test]
-    fn export_support_not_in_allowlist() {
+    fn export_support_is_in_allowlist() {
         assert_eq!(
             SUPPORTED_INIT_FLAGS & FUSE_EXPORT_SUPPORT,
-            0,
-            "FUSE_EXPORT_SUPPORT must not be advertised until root `.`/`..` lookup works"
+            FUSE_EXPORT_SUPPORT,
+            "FUSE_EXPORT_SUPPORT must be advertised when root lookup works"
         );
     }
 
