@@ -2075,8 +2075,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         let lock = self.to_file_lock(op.arg, op.header.pid);
 
-        self.state.fs_fsync(op.header.nodeid, None).await?;
-
         let conflict = self.fs.get_lock(&path, lock).await?;
         let lk = match conflict {
             Some(lk) => fuse_file_lock {
@@ -2099,8 +2097,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-
-        self.state.fs_fsync(op.header.nodeid, None).await?;
 
         let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let (flag, owner_id) = (lock.lock_flags, lock.owner_id);
@@ -2133,8 +2129,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-
-        self.state.fs_fsync(op.header.nodeid, None).await?;
 
         let conf = &self.fs.conf().client;
         let check_interval_min_ms = conf.sync_check_interval_min_ms;
