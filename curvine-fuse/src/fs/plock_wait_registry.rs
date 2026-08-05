@@ -122,6 +122,7 @@ pub(crate) enum PlockWaitDecision {
 }
 
 impl PlockWaitDecision {
+    #[cfg(test)]
     pub fn is_deadlock(&self) -> bool {
         matches!(self, Self::Deadlock { .. })
     }
