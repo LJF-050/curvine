@@ -278,15 +278,13 @@ impl CurvineFileSystem {
         Ok(RenameFlags::from_bits(flags).unwrap_or(RenameFlags::empty()))
     }
 
-    fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
+    fn to_file_lock(&self, arg: &fuse_lk_in, _header_pid: u32) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
-        // Prefer the flock pid from the kernel request; fall back to the FUSE
-        // header pid when the kernel leaves lk.pid unset (common on some paths).
-        let pid = if arg.lk.pid != 0 {
-            arg.lk.pid
-        } else {
-            header_pid
-        };
+        // Keep lk.pid == 0 intact: it identifies OFD locks, which are owned by
+        // the open file description rather than by a process. Substituting the
+        // FUSE header pid makes an OFD lock look like a POSIX lock and creates
+        // false process wait cycles in mixed OFD/POSIX workloads.
+        let pid = arg.lk.pid;
         FileLock {
             client_id,
             owner_id: arg.owner,
@@ -2149,7 +2147,9 @@ impl fs::FileSystem for CurvineFileSystem {
         }
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
-            LockOwner::new(lock.client_id.clone(), lock.owner_id),
+            // POSIX deadlock relationships are between processes, not file
+            // descriptions. Use the kernel-reported pid as the graph identity.
+            LockOwner::new(lock.client_id.clone(), u64::from(lock.pid)),
             LockWaitInfo::new(
                 op.header.unique,
                 lock.pid,
@@ -2175,10 +2175,12 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             let blocker = conflict.as_ref().expect("conflict lock");
-            let decision = detect_deadlock.then(|| {
+            // An OFD blocker (pid == 0) does not represent a process wait edge,
+            // so a POSIX waiter blocked by it cannot close a POSIX deadlock cycle.
+            let decision = (detect_deadlock && blocker.pid != 0).then(|| {
                 wait_guard.register_blocked_by(LockOwner::new(
                     blocker.client_id.clone(),
-                    blocker.owner_id,
+                    u64::from(blocker.pid),
                 ))
             });
             debug!(
@@ -2219,10 +2221,15 @@ impl fs::FileSystem for CurvineFileSystem {
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
-                let decision2 = wait_guard.register_blocked_by(LockOwner::new(
-                    blocker2.client_id.clone(),
-                    blocker2.owner_id,
-                ));
+                let decision2 = if blocker2.pid != 0 {
+                    Some(wait_guard.register_blocked_by(LockOwner::new(
+                        blocker2.client_id.clone(),
+                        u64::from(blocker2.pid),
+                    )))
+                } else {
+                    wait_guard.clear_blocked_by();
+                    None
+                };
                 debug!(
                     "plock SETLKW deadlock recheck unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
                     op.header.unique,
@@ -2238,7 +2245,7 @@ impl fs::FileSystem for CurvineFileSystem {
                     blocker2.end,
                     decision2
                 );
-                if let PlockWaitDecision::Deadlock { cycle, .. } = decision2 {
+                if let Some(PlockWaitDecision::Deadlock { cycle, .. }) = decision2 {
                     debug!(
                         "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
                         op.header.unique,
