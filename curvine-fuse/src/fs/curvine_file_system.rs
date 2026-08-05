@@ -2902,12 +2902,8 @@ mod tests {
     #[test]
     fn negotiate_out_flags_containment() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let unsafe_bits = FUSE_ATOMIC_O_TRUNC
-            | FUSE_POSIX_ACL
-            | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | FUSE_INIT_EXT;
-        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
+        let unsafe_bits = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
+        let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE | FUSE_EXPORT_SUPPORT;
         let conf = init_conf(true, true);
         let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);
         assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
