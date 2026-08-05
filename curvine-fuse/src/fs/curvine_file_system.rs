@@ -2128,6 +2128,17 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lkw(&self, op: SetLkW<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
+        info!(
+            "plock SETLKW input unique={} header_pid={} lk_pid={} owner={} lk_flags={} type={} range=[{},{}]",
+            op.header.unique,
+            op.header.pid,
+            op.arg.lk.pid,
+            op.arg.owner,
+            op.arg.lk_flags,
+            op.arg.lk.typ,
+            op.arg.lk.start,
+            op.arg.lk.end
+        );
         self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
