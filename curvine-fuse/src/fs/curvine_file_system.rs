@@ -2128,17 +2128,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lkw(&self, op: SetLkW<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
-        info!(
-            "plock SETLKW input unique={} header_pid={} lk_pid={} owner={} lk_flags={} type={} range=[{},{}]",
-            op.header.unique,
-            op.header.pid,
-            op.arg.lk.pid,
-            op.arg.owner,
-            op.arg.lk_flags,
-            op.arg.lk.typ,
-            op.arg.lk.start,
-            op.arg.lk.end
-        );
         self.ensure_writable_path(&path, RpcCode::SetLock).await?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
@@ -2161,9 +2150,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
-            // POSIX deadlock relationships are between processes, not file
-            // descriptions. Use the kernel-reported pid as the graph identity.
-            LockOwner::new(lock.client_id.clone(), u64::from(lock.pid)),
+            LockOwner::new(lock.client_id.clone(), lock.owner_id),
             LockWaitInfo::new(
                 op.header.unique,
                 lock.pid,
@@ -2194,7 +2181,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let decision = (detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid)).then(|| {
                 wait_guard.register_blocked_by(LockOwner::new(
                     blocker.client_id.clone(),
-                    u64::from(blocker.pid),
+                    blocker.owner_id,
                 ))
             });
             debug!(
@@ -2214,7 +2201,7 @@ impl fs::FileSystem for CurvineFileSystem {
             );
             if decision
                 .as_ref()
-                .is_some_and(PlockWaitDecision::is_deadlock)
+                .is_some_and(PlockWaitDecision::is_process_deadlock)
             {
                 // Cycle in the local wait graph. Re-sample Master once while
                 // keeping our edge published so a peer in a true multi-resource
@@ -2238,7 +2225,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 let decision2 = if !Self::is_ofd_lock_pid(blocker2.pid) {
                     Some(wait_guard.register_blocked_by(LockOwner::new(
                         blocker2.client_id.clone(),
-                        u64::from(blocker2.pid),
+                        blocker2.owner_id,
                     )))
                 } else {
                     wait_guard.clear_blocked_by();
@@ -2260,18 +2247,20 @@ impl fs::FileSystem for CurvineFileSystem {
                     decision2
                 );
                 if let Some(PlockWaitDecision::Deadlock { cycle, .. }) = decision2 {
-                    debug!(
-                        "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
-                        op.header.unique,
-                        lock.pid,
-                        lock.owner_id,
-                        op.header.nodeid,
-                        path,
-                        lock.start,
-                        lock.end,
-                        cycle
-                    );
-                    return err_fuse!(libc::EDEADLK);
+                    if cycle.spans_multiple_processes() {
+                        debug!(
+                            "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
+                            op.header.unique,
+                            lock.pid,
+                            lock.owner_id,
+                            op.header.nodeid,
+                            path,
+                            lock.start,
+                            lock.end,
+                            cycle
+                        );
+                        return err_fuse!(libc::EDEADLK);
+                    }
                 }
             }
 
