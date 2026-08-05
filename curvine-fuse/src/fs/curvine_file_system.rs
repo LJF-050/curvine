@@ -56,6 +56,11 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    fn is_ofd_lock_pid(pid: u32) -> bool {
+        // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
+        pid == 0 || pid == u32::MAX
+    }
+
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
         FuseMetrics::ensure_init()?;
 
@@ -280,10 +285,8 @@ impl CurvineFileSystem {
 
     fn to_file_lock(&self, arg: &fuse_lk_in, _header_pid: u32) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
-        // Keep lk.pid == 0 intact: it identifies OFD locks, which are owned by
-        // the open file description rather than by a process. Substituting the
-        // FUSE header pid makes an OFD lock look like a POSIX lock and creates
-        // false process wait cycles in mixed OFD/POSIX workloads.
+        // Keep the kernel pid intact. OFD locks use either 0 or -1 depending on
+        // the kernel and are owned by the open file description, not a process.
         let pid = arg.lk.pid;
         FileLock {
             client_id,
@@ -2136,9 +2139,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
-        // Linux reports OFD locks with lk.pid == 0 and does not perform
+        // Linux reports OFD locks with lk.pid == 0 or -1 and does not perform
         // deadlock detection for F_OFD_SETLKW; keep them out of the POSIX wait graph.
-        let detect_deadlock = op.arg.lk.pid != 0;
+        let detect_deadlock = !Self::is_ofd_lock_pid(op.arg.lk.pid);
         let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let is_unlock = lock.lock_type == LockType::UnLock;
         let full_range_unlock = Self::is_full_range_unlock(&lock);
@@ -2177,7 +2180,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let blocker = conflict.as_ref().expect("conflict lock");
             // An OFD blocker (pid == 0) does not represent a process wait edge,
             // so a POSIX waiter blocked by it cannot close a POSIX deadlock cycle.
-            let decision = (detect_deadlock && blocker.pid != 0).then(|| {
+            let decision = (detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid)).then(|| {
                 wait_guard.register_blocked_by(LockOwner::new(
                     blocker.client_id.clone(),
                     u64::from(blocker.pid),
@@ -2221,7 +2224,7 @@ impl fs::FileSystem for CurvineFileSystem {
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
-                let decision2 = if blocker2.pid != 0 {
+                let decision2 = if !Self::is_ofd_lock_pid(blocker2.pid) {
                     Some(wait_guard.register_blocked_by(LockOwner::new(
                         blocker2.client_id.clone(),
                         u64::from(blocker2.pid),
