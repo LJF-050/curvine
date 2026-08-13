@@ -190,6 +190,9 @@ pub const SUPPORTED_INIT_FLAGS: u32 = FUSE_ASYNC_READ
     | FUSE_SPLICE_READ
     | FUSE_DONT_MASK
     | FUSE_PARALLEL_DIROPS
+    // Keep HANDLE_KILLPRIV{,_V2}: daemon clears set-id itself (avoids an extra kernel
+    // FATTR_MODE setattr on write/chown/trunc). With these bits set, chown(-1,-1) arrives
+    // as setattr with valid==0; set_attr clears set-id on that empty-valid case (Option E).
     | FUSE_HANDLE_KILLPRIV
     | FUSE_ABORT_ERROR
     | FUSE_CACHE_SYMLINKS

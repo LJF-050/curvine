@@ -787,7 +787,9 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
-    /// True when normalized chown targets differ from the file's current uid/gid.
+    /// True when a normalized chown target actually changes uid and/or gid.
+    /// Kept for unit tests documenting value-inequality vs FATTR presence (#1547 leftover).
+    #[cfg(test)]
     fn chown_effectively_changes(
         target_uid: Option<u32>,
         target_gid: Option<u32>,
@@ -799,18 +801,19 @@ impl CurvineFileSystem {
 
     /// Whether chown/fchown/lchown should clear setuid/setgid on a regular file.
     ///
-    /// Linux clears these bits when ownership changes and also when both uid and gid are
-    /// explicitly specified (not `(uid_t)-1` / `(gid_t)-1` sentinels), even if the values
-    /// match the current owner (LTP chown02). Partial chown with a `-1` sentinel must not
-    /// clear when the specified id is unchanged (#1547).
-    fn chown_should_clear_setid_bits(
-        target_uid: Option<u32>,
-        target_gid: Option<u32>,
-        file_uid: u32,
-        file_gid: u32,
-    ) -> bool {
-        Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid)
-            || (target_uid.is_some() && target_gid.is_some())
+    /// Match Linux `chown_common` + `setattr_prepare`: any successful chown that presents
+    /// `FATTR_UID` and/or `FATTR_GID` clears SUID (and SGID when group-executable), including
+    /// same-id dual-target (LTP chown02) and partial `-1` sentinels (Option B). Gate on the
+    /// raw FUSE `valid` bits — not on sentinel-normalized `Option` targets — so `u32::MAX`
+    /// wire values still clear set-id while persistence continues to drop them (#1500).
+    ///
+    /// With `FUSE_HANDLE_KILLPRIV` advertised, `chown(-1,-1)` reaches userspace as setattr
+    /// with `valid == 0` (kernel strips `ATTR_KILL_*` without converting to `FATTR_MODE`).
+    /// Treat that empty-valid setattr as the killpriv chown signal (Option E) so we still
+    /// clear set-id without dropping killpriv / adding kernel round-trips.
+    /// SGID without group-exec (mandatory lock) is kept by the caller.
+    fn chown_should_clear_setid_bits(valid: u32) -> bool {
+        (valid & (FATTR_UID | FATTR_GID)) != 0 || valid == 0
     }
 
     /// POSIX permission model for SETATTR issued by a non-root caller.
@@ -820,10 +823,8 @@ impl CurvineFileSystem {
     /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
     /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
     /// current id and be a no-op ownership change (see `chown_effectively_changes`).
-    /// Setuid/setgid clearing is governed separately: explicit dual-target chown clears even
-    /// when ids are unchanged, while partial single-target chown does not (see
-    /// `chown_should_clear_setid_bits`). We no longer need to inspect the raw
-    /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
+    /// Setuid/setgid clearing is governed separately via raw `FATTR_UID`/`FATTR_GID` bits
+    /// (see `chown_should_clear_setid_bits`); sentinel normalization must not suppress that.
     fn check_setattr_permission(
         check_permission: bool,
         header: &fuse_in_header,
@@ -1447,9 +1448,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Clear setuid/setgid on real ownership changes and on explicit dual-target chown.
-        let chown_effective =
-            Self::chown_should_clear_setid_bits(target_uid, target_gid, file_uid, file_gid);
+        // Clear setuid/setgid on chown: FATTR_UID/GID (Option B) or empty valid under
+        // HANDLE_KILLPRIV for chown(-1,-1) (Option E).
+        let chown_effective = Self::chown_should_clear_setid_bits(op.arg.valid);
         if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
@@ -2779,45 +2780,26 @@ mod tests {
         ));
     }
 
+    /// LTP chown02 / #1567: dual-target same-owner still presents both FATTR bits.
     #[test]
     fn chown_should_clear_setid_bits_for_explicit_same_owner_chown02() {
         use super::CurvineFileSystem as CFS;
-        assert!(CFS::chown_should_clear_setid_bits(Some(0), Some(0), 0, 0));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
     }
 
+    /// Linux matrix under HANDLE_KILLPRIV: UID/GID FATTR clear; empty valid is chown(-1,-1).
     #[test]
-    fn chown_should_clear_setid_bits_preserves_sentinel_noops() {
+    fn chown_should_clear_setid_bits_on_any_fattr_uid_or_gid() {
         use super::CurvineFileSystem as CFS;
-        assert!(!CFS::chown_should_clear_setid_bits(None, None, 1000, 100));
-        assert!(!CFS::chown_should_clear_setid_bits(
-            None,
-            Some(100),
-            1000,
-            100
-        ));
-        assert!(!CFS::chown_should_clear_setid_bits(
-            Some(1000),
-            None,
-            1000,
-            100
-        ));
-    }
-
-    #[test]
-    fn chown_should_clear_setid_bits_on_real_ownership_change() {
-        use super::CurvineFileSystem as CFS;
-        assert!(CFS::chown_should_clear_setid_bits(
-            Some(2000),
-            Some(200),
-            1000,
-            100
-        ));
-        assert!(CFS::chown_should_clear_setid_bits(
-            None,
-            Some(200),
-            1000,
-            100
-        ));
+        // chown(-1, same_gid) / chown(same_uid, -1) / real single-sided change
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_GID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+        // Option E: killpriv strips ATTR_KILL_* for chown(-1,-1) → valid==0
+        assert!(CFS::chown_should_clear_setid_bits(0));
+        // mode-only / time-only setattr is not a chown
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MODE));
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MTIME));
     }
 
     /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a
