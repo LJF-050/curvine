@@ -120,10 +120,13 @@ impl WorkerReplicationManager {
             Ok(permit) => permit,
             Err(e) => return err_box!("replication semaphore closed: {}", e),
         };
-        let (block_meta, mut reader) = self.block_store.open_reader_by_id(job.block_id, 0, 0)?;
+        let block_meta = self.block_store.get_block(job.block_id)?;
         if block_meta.state != BlockState::Finalized {
             return err_box!("Block: {} is not finalized", job.block_id);
         }
+        let (_, mut reader) =
+            self.block_store
+                .open_reader_by_id(job.block_id, 0, block_meta.len)?;
         // update the storage type for the replication job.
         job.with_storage_type(block_meta.storage_type());
         let extend_block =
